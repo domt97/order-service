@@ -1,0 +1,6 @@
+aws:
+  # For local development with LocalStack
+  region: ${AWS_REGION:eu-west-1}
+  endpoint: ${AWS_ENDPOINT:http://localhost:4566}
+  access-key: ${AWS_ACCESS_KEY:test}
+  secret-key: ${AWS_SECRET_KEY:test}
