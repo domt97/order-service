@@ -47,7 +47,38 @@ spring:
     user: ${DB_USER:postgres}
     password: ${DB_PASSWORD:postgres}
 
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
 app:
+  kafka:
+    place-checkout:
+      # Off until placement is built (next PR): a checkout that passes every check is not placed yet, so PlaceCheckout
+      # must not be consumed where carts send it. Also gates the PlaceCheckout.DLT topic bean.
+      # Poll sizing (max.poll.records=1 on the listener): worst case per record = lookup (Hikari wait 20 s) + quoting
+      # <= quote-budget (20 s) + outcome transaction (20 s wait + 5 s) + re-read after a lost insert (20 s wait) +
+      # CONTENT_MISMATCH transaction (20 s + 5 s) = 110 s, + 60 s backoff = 170 s < max.poll.interval.ms (300 s).
+      # Re-check when one of these changes.
+      enabled: ${PLACE_CHECKOUT_ENABLED:false}
+    # Replication factor of the dead-letter topics (PlaceCheckout.DLT); 3 in production.
+    dlt-replicas: ${KAFKA_DLT_REPLICAS:1}
+  checkout:
+    # ADR 0007: no checkout for the key and requestedAt older than this -> STALE (shorter than the 15-min stock hold).
+    stale-after: ${CHECKOUT_STALE_AFTER:PT10M}
+    # requestedAt later than now + clock-skew -> INVALID_REQUEST.
+    clock-skew: ${CHECKOUT_CLOCK_SKEW:PT30S}
+    # Time for all order-quote calls of one command; a store not answered within it -> STORE_UNAVAILABLE.
+    quote-budget: ${CHECKOUT_QUOTE_BUDGET:PT20S}
+  clients:
+    stores:
+      base-url: ${STORES_SERVICE_URL:http://localhost:8048}
+      connect-timeout: ${STORES_CONNECT_TIMEOUT:PT1S}
+      # Per call, capped by what is left of quote-budget.
+      read-timeout: ${STORES_READ_TIMEOUT:PT3S}
   # MDC request fields: the oms-core defaults (merchantId, storeId, productId, ...). Add `orderId` (uuid) here with the
   # first /orders/{orderId} path.
   swagger:
