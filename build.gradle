@@ -1,0 +1,109 @@
+plugins {
+	id 'java'
+	id 'org.springframework.boot' version '3.2.3'
+	id 'io.spring.dependency-management' version '1.1.4'
+}
+
+group = 'com.dotran.oms'
+version = '0.0.1-SNAPSHOT'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+}
+
+repositories {
+	mavenCentral()
+	// oms-core comes only from GitHub Packages, and GitHub Packages serves only oms-core (ADR 0005).
+	// Credentials are optional: a local build with ../oms-core uses the composite build and never asks this repository.
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = 'GitHubPackages'
+				url = uri('https://maven.pkg.github.com/domt97/oms-core')
+				def gprUser = providers.gradleProperty('gpr.user').orElse(providers.environmentVariable('GITHUB_ACTOR')).getOrNull()
+				def gprKey = providers.gradleProperty('gpr.key').orElse(providers.environmentVariable('GITHUB_TOKEN')).getOrNull()
+				if (gprUser && gprKey) {
+					credentials {
+						username = gprUser
+						password = gprKey
+					}
+				}
+			}
+		}
+		filter {
+			includeGroup 'com.dotran.oms'
+		}
+	}
+}
+
+// Skeleton: only what the service needs today. Add spring-kafka with the first consumer (PlaceCheckout, stock replies)
+// and the contract-test wiring with the first message this service publishes.
+dependencies {
+
+	implementation "com.dotran.oms:oms-core:${coreVersion}"
+
+	implementation "org.springframework.boot:spring-boot-starter-data-jpa"
+	implementation "org.springframework.boot:spring-boot-starter-web"
+	implementation 'org.springframework.boot:spring-boot-starter-validation'
+	implementation "org.springframework.boot:spring-boot-configuration-processor"
+	implementation 'org.mapstruct:mapstruct:1.6.3'
+	implementation 'org.projectlombok:lombok'
+
+	// Swagger (oms-core SwaggerConfig is built on springdoc)
+	implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.3.0")
+
+	implementation 'org.postgresql:postgresql'
+
+	// Flyway
+	implementation 'org.flywaydb:flyway-core'
+
+	annotationProcessor 'org.projectlombok:lombok'
+	annotationProcessor 'org.projectlombok:lombok-mapstruct-binding:0.2.0'
+	annotationProcessor 'org.mapstruct:mapstruct-processor:1.6.3'
+	annotationProcessor "org.springframework.boot:spring-boot-configuration-processor"
+
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testCompileOnly 'org.projectlombok:lombok'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+	testAnnotationProcessor 'org.projectlombok:lombok'
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}
+
+// Testcontainers 1.21.4 works with recent Docker Engine releases; the Boot 3.2.3 BOM would pick 1.19.x.
+ext['testcontainers.version'] = '1.21.4'
+
+// Integration tests (Flyway, native SQL, constraints, transactions) against Postgres in Docker (Testcontainers).
+// Run with ./gradlew integrationTest; not part of `test` or `check`. CI runs them in the job "Integration tests".
+testing {
+	suites {
+		integrationTest(JvmTestSuite) {
+			useJUnitJupiter()
+			dependencies {
+				implementation project()
+				implementation 'org.springframework.boot:spring-boot-starter-test'
+				implementation 'org.testcontainers:postgresql'
+				implementation 'org.testcontainers:junit-jupiter'
+				compileOnly 'org.projectlombok:lombok'
+				annotationProcessor 'org.projectlombok:lombok'
+				runtimeOnly 'org.junit.platform:junit-platform-launcher'
+			}
+			targets {
+				all {
+					testTask.configure {
+						shouldRunAfter(test)
+					}
+				}
+			}
+		}
+	}
+}
+
+configurations {
+	integrationTestImplementation.extendsFrom implementation
+	integrationTestRuntimeOnly.extendsFrom runtimeOnly
+}

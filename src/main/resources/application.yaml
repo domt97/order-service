@@ -1,0 +1,69 @@
+server:
+  port: 8068
+
+spring:
+  application:
+    name: order-service
+
+  # Shared settings of every OMS service (springdoc, AWS client): oms-core's application-core.yaml.
+  # A profile file wins over this file, so override those values with an environment variable or a later profile.
+  profiles:
+    include: core
+
+  # Database `orders`, schema `orders` (`order` is a reserved word). Flyway creates the schema (flyway.schemas below);
+  # no manual CREATE SCHEMA is needed.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orders?currentSchema=orders
+    driver-class-name: org.postgresql.Driver
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      idle-timeout: 30000
+      connection-timeout: 20000
+      max-lifetime: 1800000
+
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        default_batch_fetch_size: 50
+        query:
+          in_clause_parameter_padding: true
+        jdbc:
+          batch_size: 50
+
+  flyway:
+    enabled: true
+    validate-on-migrate: true
+    # No baseline-on-migrate: a new, empty database. With it, a table created in `orders` before the first migrate
+    # (e.g. the Debezium heartbeat SQL) would make Flyway baseline and skip the first migration.
+    locations: classpath:db/migration
+    schemas: orders
+    default-schema: orders
+    url: jdbc:postgresql://localhost:5432/orders?currentSchema=orders
+    user: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+
+app:
+  # MDC request fields: the oms-core defaults (merchantId, storeId, productId, ...). Add `orderId` (uuid) here with the
+  # first /orders/{orderId} path.
+  swagger:
+    title: Order Service API
+    version: v1
+    description: Order service REST API
+
+logging:
+  pattern:
+    # MDC (requestId, merchantId, storeId ...) in front of every line; see oms-core MdcKeys.
+    correlation: "[%X] "
+  level:
+    root: INFO
+    org:
+      hibernate:
+        SQL: OFF
+        orm:
+          jdbc:
+            bind: OFF
