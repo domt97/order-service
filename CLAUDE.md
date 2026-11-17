@@ -24,8 +24,11 @@ Order of steps, every copy of a command answered the same way (BR-ORD-05):
 1. the key's stored row for this customer (`checkouts`, unique `(cart_id, cart_version)`): same content hash → its
    outcome again (new eventId, same reasons and `checkoutId`); other hash → `CONTENT_MISMATCH` (reply only, no
    `checkoutId`, no row written or changed);
-2. contract rules (`PlaceCheckoutValidator`) → `INVALID_REQUEST`; a SKU with NUL or > 100 chars is reported on its
-   store, never with its text (JSONB refuses `\u0000`);
+2. contract rules (`PlaceCheckoutValidator`) → `INVALID_REQUEST`. Lengths count Unicode code points (as JSON Schema
+   `maxLength` does), blank means `Character.isWhitespace`, and no text field may hold NUL or an unpaired surrogate.
+   A bad SKU (NUL, surrogate, blank, > 100) is reported on its store, never with its text (JSONB refuses `\u0000`); a
+   bad delivery field (caps in BR-ORD-15) is one checkout-level reason, no text; a `lineId` used twice in the command
+   is reported on the later line, or only on its store if that line's SKU is bad (BR-ORD-14);
 3. `requestedAt` older than `app.checkout.stale-after` (10 min) → `STALE`;
 4. one `order-quote` per store **outside any transaction**, within `quote-budget` (20 s) → `QuoteReasonMapper`
    (not ACTIVE → `STORE_INACTIVE`; not open → `STORE_CLOSED`; SUSPENDED → `MERCHANT_SUSPENDED`; found=false or another
@@ -87,7 +90,7 @@ built on the injected `RestClient.Builder` sends the MDC `requestId` as `X-Reque
   (`support/PostgresIT`, with the checkout services, the consumer and a stub order-quote client). The outbox as
   Debezium sees it through a `test_decoding` slot (`support/WalSlot`). `CheckoutSqlIT`, `OutboxSqlIT`,
   `CheckoutTransactionIT` (rollback, SET LOCAL), `PlaceCheckoutConsumerIT` (JSON in → row + reply in the WAL; races
-  with the same and with different content; NUL SKU), `FlywayMigrationIT`.
+  with the same and with different content; NUL SKU; a 100-code-point emoji SKU through JSONB), `FlywayMigrationIT`.
   Run: `./gradlew integrationTest`; CI job `Integration tests` (not a required check yet).
 
 ## Git workflow

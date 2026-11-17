@@ -79,6 +79,23 @@ class PlaceCheckoutConsumerTest {
     }
 
     @Test
+    @DisplayName("JSON escapes NUL, a surrogate pair and a lone \\ud800 reach the command as written, plain and double-encoded")
+    void unicodeEscapes() throws Exception {
+        String value = MESSAGE.replace("\"1 Le Loi\"", "\"1 Le\\u0000Loi\"")
+                .replace("\"Nguyen Van A\"", "\"A\\ud83d\\ude00\"")
+                .replace("\"TS-M\"", "\"TS\\ud800\"");
+        consumer.consume(record(value));
+        consumer.consume(record(new ObjectMapper().writeValueAsString(value)));
+        ArgumentCaptor<PlaceCheckoutCmd> cmd = ArgumentCaptor.forClass(PlaceCheckoutCmd.class);
+        verify(useCase, org.mockito.Mockito.times(2)).place(cmd.capture());
+        for (PlaceCheckoutCmd c : cmd.getAllValues()) {
+            assertThat(c.delivery().address().line1()).isEqualTo("1 Le\u0000Loi");
+            assertThat(c.delivery().recipientName()).isEqualTo("A\uD83D\uDE00");
+            assertThat(c.stores().get(0).lines().get(0).sku()).isEqualTo("TS\uD800");
+        }
+    }
+
+    @Test
     @DisplayName("wrong eventType or a missing / invalid key field → InvalidPlaceCheckoutMessageException, no call")
     void invalidKeyFields() {
         for (String bad : new String[]{

@@ -111,7 +111,7 @@ class PlaceCheckoutValidatorTest {
     }
 
     @Test
-    @DisplayName("a SKU with NUL, over 100 characters or blank: INVALID_REQUEST on the store, the SKU text never in it")
+    @DisplayName("a SKU with NUL, over 100 code points or blank: INVALID_REQUEST on the store, the SKU text never in it")
     void unstorableSku() {
         for (String sku : new String[]{"A\u0000B", "X".repeat(101), " ", ""}) {
             List<RejectionReason> reasons = validate(withLines(line(sku)));
@@ -138,6 +138,135 @@ class PlaceCheckoutValidatorTest {
         for (PlaceCheckoutCmd.Delivery d : bad) {
             assertThat(validate(Checkouts.valid().delivery(d).build()))
                     .containsExactly(RejectionReason.checkout(RejectionCode.INVALID_REQUEST));
+        }
+    }
+
+    private static final UUID OTHER_STORE = UUID.fromString("00000000-0000-0000-0000-00000000b002");
+    private static final String EMOJI = "\uD83D\uDE00";
+
+    private static PlaceCheckoutCmd.Line lineWithId(UUID lineId, String sku) {
+        return new PlaceCheckoutCmd.Line(lineId, Checkouts.PRODUCT, sku, 1);
+    }
+
+    private List<RejectionReason> withStores(PlaceCheckoutCmd.Store... stores) {
+        return validator.validate(Checkouts.valid().stores(List.of(stores)).build(), NOW);
+    }
+
+    @Test
+    @DisplayName("a lineId used twice: INVALID_REQUEST on the later line, in the same store or another one")
+    void duplicateLineId() {
+        UUID id = UUID.randomUUID();
+        assertThat(withStores(store(STORE, lineWithId(id, "A"), lineWithId(id, "B"))))
+                .containsExactly(RejectionReason.line(RejectionCode.INVALID_REQUEST, STORE, "B"));
+        assertThat(withStores(store(STORE, lineWithId(id, "A")), store(OTHER_STORE, lineWithId(id, "A"))))
+                .containsExactly(RejectionReason.line(RejectionCode.INVALID_REQUEST, OTHER_STORE, "A"));
+        assertThat(withStores(store(STORE, lineWithId(id, "A")), store(OTHER_STORE, lineWithId(id, "B"))))
+                .containsExactly(RejectionReason.line(RejectionCode.INVALID_REQUEST, OTHER_STORE, "B"));
+        assertThat(withStores(store(STORE, lineWithId(id, "A"), lineWithId(id, "B"), lineWithId(id, "C")))).containsExactly(
+                RejectionReason.line(RejectionCode.INVALID_REQUEST, STORE, "B"),
+                RejectionReason.line(RejectionCode.INVALID_REQUEST, STORE, "C"));
+        // same lineId and same SKU on one line: one reason
+        assertThat(withStores(store(STORE, lineWithId(id, "A"), lineWithId(id, "A"))))
+                .containsExactly(RejectionReason.line(RejectionCode.INVALID_REQUEST, STORE, "A"));
+        // null lineIds are reported as missing, never as duplicates of each other
+        assertThat(withStores(store(STORE, lineWithId(null, "A"), lineWithId(null, "B")))).containsExactly(
+                RejectionReason.line(RejectionCode.INVALID_REQUEST, STORE, "A"),
+                RejectionReason.line(RejectionCode.INVALID_REQUEST, STORE, "B"));
+    }
+
+    @Test
+    @DisplayName("a line with a bad SKU still claims its lineId; a bad-SKU line reusing one gets only the store reason")
+    void duplicateLineIdWithBadSku() {
+        UUID id = UUID.randomUUID();
+        assertThat(withStores(store(STORE, lineWithId(id, "A\u0000")), store(OTHER_STORE, lineWithId(id, "B")))).containsExactly(
+                RejectionReason.store(RejectionCode.INVALID_REQUEST, STORE),
+                RejectionReason.line(RejectionCode.INVALID_REQUEST, OTHER_STORE, "B"));
+        List<RejectionReason> reverse = withStores(store(STORE, lineWithId(id, "A"), lineWithId(id, "B\u0000")));
+        assertThat(reverse).containsExactly(RejectionReason.store(RejectionCode.INVALID_REQUEST, STORE));
+        assertThat(reverse).allSatisfy(r -> assertThat(r.sku()).isNull());
+    }
+
+    @Test
+    @DisplayName("a null line (\"lines\":[null]) or a null SKU: INVALID_REQUEST on the store; a null-SKU line still claims its lineId")
+    void nullLineAndSku() {
+        List<PlaceCheckoutCmd.Line> withNull = new ArrayList<>();
+        withNull.add(null);
+        assertThat(withStores(new PlaceCheckoutCmd.Store(Checkouts.MERCHANT, STORE, UUID.randomUUID(), withNull)))
+                .containsExactly(RejectionReason.store(RejectionCode.INVALID_REQUEST, STORE));
+        UUID id = UUID.randomUUID();
+        assertThat(withStores(store(STORE, lineWithId(id, null)), store(OTHER_STORE, lineWithId(id, "B"))))
+                .containsExactly(RejectionReason.store(RejectionCode.INVALID_REQUEST, STORE),
+                        RejectionReason.line(RejectionCode.INVALID_REQUEST, OTHER_STORE, "B"));
+    }
+
+    @Test
+    @DisplayName("a store without storeId is not walked: its lineIds are not claimed, only the checkout-level reason")
+    void nullStoreIdClaimsNothing() {
+        UUID id = UUID.randomUUID();
+        assertThat(withStores(store(null, lineWithId(id, "A")), store(OTHER_STORE, lineWithId(id, "A"))))
+                .containsExactly(RejectionReason.checkout(RejectionCode.INVALID_REQUEST));
+    }
+
+    @Test
+    @DisplayName("SKU: 100 code points (emoji) fine, 101 not; unpaired surrogates and Unicode blanks on the store")
+    void skuCodePoints() {
+        assertThat(validate(withLines(line(EMOJI.repeat(100))))).isEmpty();
+        for (String sku : new String[]{EMOJI.repeat(101), "A\uD800", "\uDC00", "\uDC00\uD800", "\u3000", "\u001F"}) {
+            List<RejectionReason> reasons = validate(withLines(line(sku)));
+            assertThat(reasons).as(sku).containsExactly(RejectionReason.store(RejectionCode.INVALID_REQUEST, STORE));
+            assertThat(reasons).allSatisfy(r -> assertThat(r.sku()).isNull());
+        }
+        assertThat(validate(withLines(line("\u00A0")))).isEmpty();
+    }
+
+    /** One delivery with field {@code index} (0 line1 … 5 postalCode, 6 name, 7 phone) set to {@code value}. */
+    private static PlaceCheckoutCmd.Delivery deliveryWith(int index, String value) {
+        String[] f = {"1 Le Loi", null, "Ben Nghe", "1", "Ho Chi Minh", null, "Nguyen Van A", "0901234567"};
+        f[index] = value;
+        return new PlaceCheckoutCmd.Delivery(new PlaceCheckoutCmd.Address(f[0], f[1], f[2], f[3], f[4], "VN", f[5]),
+                f[6], f[7]);
+    }
+
+    private static final int[] MAX = {255, 255, 100, 100, 100, 20, 255, 32};
+    private static final boolean[] REQUIRED = {true, false, false, false, true, false, true, true};
+
+    private List<RejectionReason> withDelivery(PlaceCheckoutCmd.Delivery d) {
+        return validate(Checkouts.valid().delivery(d).build());
+    }
+
+    @Test
+    @DisplayName("each delivery field: at its cap fine, one over not; an emoji counts as one; NUL or a lone half not")
+    void deliveryLimits() {
+        RejectionReason invalid = RejectionReason.checkout(RejectionCode.INVALID_REQUEST);
+        for (int i = 0; i < MAX.length; i++) {
+            assertThat(withDelivery(deliveryWith(i, "a".repeat(MAX[i])))).as("field %d at cap", i).isEmpty();
+            assertThat(withDelivery(deliveryWith(i, EMOJI.repeat(MAX[i])))).as("field %d emoji at cap", i).isEmpty();
+            assertThat(withDelivery(deliveryWith(i, "a".repeat(MAX[i] + 1)))).as("field %d over", i)
+                    .containsExactly(invalid);
+            for (String bad : new String[]{"a\u0000b", "a\uD800", "\uDC00", "\uDC00\uD800"}) {
+                List<RejectionReason> reasons = withDelivery(deliveryWith(i, bad));
+                assertThat(reasons).as("field %d", i).containsExactly(invalid);
+                assertThat(reasons).allSatisfy(r -> assertThat(r.sku()).isNull());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("blank is Character.isWhitespace: U+3000 or U+001F alone is blank, U+00A0 is not; optional may be empty")
+    void deliveryBlank() {
+        RejectionReason invalid = RejectionReason.checkout(RejectionCode.INVALID_REQUEST);
+        for (int i = 0; i < MAX.length; i++) {
+            if (REQUIRED[i]) {
+                for (String blank : new String[]{"", " ", "\u3000", "\u001F", "\t\u2028"}) {
+                    assertThat(withDelivery(deliveryWith(i, blank))).as("field %d blank", i).containsExactly(invalid);
+                }
+                assertThat(withDelivery(deliveryWith(i, null))).as("field %d null", i).containsExactly(invalid);
+                assertThat(withDelivery(deliveryWith(i, "\u00A0"))).as("field %d nbsp", i).isEmpty();
+            } else {
+                assertThat(withDelivery(deliveryWith(i, null))).as("field %d null", i).isEmpty();
+                assertThat(withDelivery(deliveryWith(i, ""))).as("field %d empty", i).isEmpty();
+                assertThat(withDelivery(deliveryWith(i, " "))).as("field %d space", i).isEmpty();
+            }
         }
     }
 

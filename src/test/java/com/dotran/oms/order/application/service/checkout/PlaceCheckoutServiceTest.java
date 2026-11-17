@@ -191,6 +191,39 @@ class PlaceCheckoutServiceTest {
     }
 
     @Test
+    @DisplayName("a NUL in the address: REJECTED INVALID_REQUEST stored, no quote")
+    void nulAddress() {
+        when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.empty());
+        when(transactions.storeOutcome(any(), any())).thenReturn(true);
+        PlaceCheckoutCmd.Delivery nul = new PlaceCheckoutCmd.Delivery(new PlaceCheckoutCmd.Address("1 Le\u0000Loi", null,
+                null, null, "Ho Chi Minh", "VN", null), "Nguyen Van A", "0901234567");
+        assertThat(service.place(Checkouts.valid().delivery(nul).build()))
+                .isEqualTo(PlaceCheckoutOutcome.REJECTED_STORED);
+        ArgumentCaptor<Checkout> row = ArgumentCaptor.forClass(Checkout.class);
+        verify(transactions).storeOutcome(row.capture(), any());
+        assertThat(row.getValue().reasons()).containsExactly(RejectionReason.checkout(RejectionCode.INVALID_REQUEST));
+        verify(orderQuoteClient, never()).quote(any(), any(), anyList(), any());
+    }
+
+    @Test
+    @DisplayName("a key stored as INVALID_REQUEST keeps that answer even if the content would pass today (BR-ORD-05)")
+    void storedAnswerWins() {
+        // e.g. a 255-code-point emoji name, rejected by the old UTF-16 count and valid now
+        PlaceCheckoutCmd cmd = Checkouts.valid().delivery(new PlaceCheckoutCmd.Delivery(
+                Checkouts.delivery().address(), "\uD83D\uDE00".repeat(255), "0901234567")).build();
+        when(checkoutRepository.findByKey(cmd.cartId(), 3, cmd.customerId()))
+                .thenReturn(Optional.of(stored(cmd, CheckoutStatus.REJECTED, RejectionCode.INVALID_REQUEST)));
+
+        assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.REPUBLISHED);
+        ArgumentCaptor<OutboxMessage> reply = ArgumentCaptor.forClass(OutboxMessage.class);
+        verify(transactions).publish(reply.capture());
+        assertThat(payload(reply.getValue()).reasons()).extracting(CheckoutRejectedEvent.Reason::code)
+                .containsExactly("INVALID_REQUEST");
+        verify(orderQuoteClient, never()).quote(any(), any(), anyList(), any());
+        verify(transactions, never()).storeOutcome(any(), any());
+    }
+
+    @Test
     @DisplayName("lost insert, re-read same content: the winner's outcome is sent; never a second row")
     void lostInsertSameContent() {
         PlaceCheckoutCmd cmd = Checkouts.valid().build();
