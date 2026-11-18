@@ -55,7 +55,7 @@ class CheckoutRejectedContractTest {
     }
 
     @Test
-    @DisplayName("PlaceCheckout: the sample the consumer test uses is valid; a SKU with NUL or over 100 characters is not")
+    @DisplayName("PlaceCheckout: the sample the consumer test uses is valid; a SKU with NUL or over 100 code points is not")
     void placeCheckoutSample() throws Exception {
         String sample = com.dotran.oms.order.infrastructure.message.PlaceCheckoutConsumerTestAccess.sample();
         assertThat(ContractSchemas.validate("PlaceCheckout", mapper.readTree(sample))).isEmpty();
@@ -67,5 +67,46 @@ class CheckoutRejectedContractTest {
                 "\"   \"")))).isNotEmpty();
         assertThat(ContractSchemas.validate("PlaceCheckout", mapper.readTree(sample.replace("\"TS-M\"",
                 "\"A B\"")))).isEmpty();
+        assertThat(ContractSchemas.validate("PlaceCheckout", mapper.readTree(sample.replace("\"TS-M\"",
+                "\"\\u3000\"")))).isNotEmpty();
+    }
+
+    /** The consumer sample with {@code field} (a JSON string inside delivery) added or replaced by {@code value}. */
+    private JsonNode sampleWith(String field, String value) throws Exception {
+        JsonNode node = mapper.readTree(
+                com.dotran.oms.order.infrastructure.message.PlaceCheckoutConsumerTestAccess.sample());
+        com.fasterxml.jackson.databind.node.ObjectNode delivery =
+                (com.fasterxml.jackson.databind.node.ObjectNode) node.get("delivery");
+        com.fasterxml.jackson.databind.node.ObjectNode target = "recipientName".equals(field) || "phone".equals(field)
+                ? delivery : (com.fasterxml.jackson.databind.node.ObjectNode) delivery.get("address");
+        target.put(field, value);
+        return node;
+    }
+
+    @Test
+    @DisplayName("PlaceCheckout delivery: caps in code points, NUL refused, blank = Character.isWhitespace")
+    void placeCheckoutDelivery() throws Exception {
+        String[] fields = {"line1", "line2", "ward", "district", "city", "postalCode", "recipientName", "phone"};
+        int[] max = {255, 255, 100, 100, 100, 20, 255, 32};
+        boolean[] required = {true, false, false, false, true, false, true, true};
+        String emoji = "\uD83D\uDE00";
+        for (int i = 0; i < fields.length; i++) {
+            String f = fields[i];
+            assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, "a".repeat(max[i])))).as(f).isEmpty();
+            assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, emoji.repeat(max[i])))).as(f).isEmpty();
+            assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, "a".repeat(max[i] + 1)))).as(f)
+                    .isNotEmpty();
+            assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, emoji.repeat(max[i] + 1)))).as(f)
+                    .isNotEmpty();
+            assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, "a\u0000b"))).as(f).isNotEmpty();
+            if (required[i]) {
+                for (String blank : new String[]{"", " ", "\u3000", "\u001F", "\t\u2028"}) {
+                    assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, blank))).as(f).isNotEmpty();
+                }
+                assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, "\u00A0"))).as(f).isEmpty();
+            } else {
+                assertThat(ContractSchemas.validate("PlaceCheckout", sampleWith(f, ""))).as(f).isEmpty();
+            }
+        }
     }
 }

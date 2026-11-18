@@ -53,6 +53,34 @@ class ContentHashTest {
                 .customerId(CustomerId.of(UUID.randomUUID())).build())).isNotEqualTo(base);
     }
 
+    private static PlaceCheckoutCmd.Delivery deliveryWithLine1(String line1) {
+        return new PlaceCheckoutCmd.Delivery(new PlaceCheckoutCmd.Address(line1, null, null, null, "X", "VN", null), "N",
+                "1");
+    }
+
+    @Test
+    @DisplayName("NUL and a very long field hash without error; a lone surrogate hashes like '?' (JDK getBytes)")
+    void oddText() {
+        assertThat(ContentHash.of(Checkouts.valid().delivery(deliveryWithLine1("a\u0000b")).build())).hasSize(64);
+        assertThat(ContentHash.of(Checkouts.valid().delivery(deliveryWithLine1("x".repeat(100_000))).build()))
+                .hasSize(64);
+        // Pinned on purpose: such a command is INVALID_REQUEST, so a re-send with '?' gets that stored answer instead
+        // of CONTENT_MISMATCH. Changing ContentHash would change every stored hash.
+        List<PlaceCheckoutCmd.Store> stores = List.of(store(STORE, line("A")));
+        assertThat(ContentHash.of(Checkouts.valid().stores(stores).delivery(deliveryWithLine1("a\uD800")).build()))
+                .isEqualTo(ContentHash.of(Checkouts.valid().stores(stores).delivery(deliveryWithLine1("a?")).build()));
+    }
+
+    @Test
+    @DisplayName("the lineId is part of the content")
+    void lineIdInHash() {
+        PlaceCheckoutCmd.Line a = line("A");
+        PlaceCheckoutCmd.Line sameButOtherId = new PlaceCheckoutCmd.Line(UUID.randomUUID(), a.productId(), "A",
+                a.quantity());
+        assertThat(ContentHash.of(Checkouts.valid().stores(List.of(store(STORE, a))).build()))
+                .isNotEqualTo(ContentHash.of(Checkouts.valid().stores(List.of(store(STORE, sameButOtherId))).build()));
+    }
+
     @Test
     @DisplayName("fields are length-prefixed: moving text between two fields changes the hash")
     void lengthPrefixed() {

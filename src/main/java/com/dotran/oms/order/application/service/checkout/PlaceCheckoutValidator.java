@@ -17,8 +17,10 @@ import java.util.regex.Pattern;
 
 /**
  * The rules of the PlaceCheckout contract that a readable command can break; each break is an INVALID_REQUEST reason
- * (store- or line-level where it can be placed). A SKU that cannot be stored (NUL, over 100 characters) is reported
- * on its store only, never with its text.
+ * (store- or line-level where it can be placed). Lengths are counted in Unicode code points, as JSON Schema
+ * {@code maxLength} does. A SKU that cannot be stored (NUL, an unpaired surrogate, blank, over 100 code points) is
+ * reported on its store only, never with its text. A bad delivery field is one checkout-level reason without any text
+ * (personal data, BR-ORD-15). A lineId appears once in the whole command (BR-ORD-14).
  */
 @Component
 @RequiredArgsConstructor
@@ -29,6 +31,14 @@ public class PlaceCheckoutValidator {
     static final int MAX_SKU_LENGTH = 100;
     static final int MIN_QUANTITY = 1;
     static final int MAX_QUANTITY = 99;
+    static final int MAX_LINE1 = 255;
+    static final int MAX_LINE2 = 255;
+    static final int MAX_WARD = 100;
+    static final int MAX_DISTRICT = 100;
+    static final int MAX_CITY = 100;
+    static final int MAX_POSTAL_CODE = 20;
+    static final int MAX_RECIPIENT_NAME = 255;
+    static final int MAX_PHONE = 32;
     private static final Pattern COUNTRY = Pattern.compile("^[A-Z]{2}$");
 
     private final CheckoutProperties properties;
@@ -47,6 +57,7 @@ public class PlaceCheckoutValidator {
             return RejectionReason.normalise(reasons);
         }
         Set<UUID> storeIds = new HashSet<>();
+        Set<UUID> lineIds = new HashSet<>();
         for (PlaceCheckoutCmd.Store store : stores) {
             if (store == null || store.storeId() == null) {
                 reasons.add(RejectionReason.checkout(RejectionCode.INVALID_REQUEST));
@@ -56,12 +67,12 @@ public class PlaceCheckoutValidator {
             if (!storeIds.add(storeId) || store.merchantId() == null || store.quoteId() == null) {
                 reasons.add(RejectionReason.store(RejectionCode.INVALID_REQUEST, storeId));
             }
-            validateLines(store, reasons);
+            validateLines(store, lineIds, reasons);
         }
         return RejectionReason.normalise(reasons);
     }
 
-    private static void validateLines(PlaceCheckoutCmd.Store store, List<RejectionReason> reasons) {
+    private static void validateLines(PlaceCheckoutCmd.Store store, Set<UUID> lineIds, List<RejectionReason> reasons) {
         UUID storeId = store.storeId();
         List<PlaceCheckoutCmd.Line> lines = store.lines();
         if (lines == null || lines.isEmpty() || lines.size() > MAX_LINES) {
@@ -70,22 +81,31 @@ public class PlaceCheckoutValidator {
         }
         Set<String> skus = new HashSet<>();
         for (PlaceCheckoutCmd.Line line : lines) {
-            if (line == null || line.sku() == null || line.sku().isBlank() || !storable(line.sku())) {
+            if (line == null) {
                 reasons.add(RejectionReason.store(RejectionCode.INVALID_REQUEST, storeId));
                 continue;
             }
-            boolean duplicate = !skus.add(line.sku());
+            // Claimed before the SKU check, so a line with a bad SKU still takes its lineId.
+            boolean duplicateLineId = line.lineId() != null && !lineIds.add(line.lineId());
+            if (!storable(line.sku())) {
+                reasons.add(RejectionReason.store(RejectionCode.INVALID_REQUEST, storeId));
+                continue;
+            }
+            boolean duplicateSku = !skus.add(line.sku());
             boolean badQuantity = line.quantity() == null || line.quantity() < MIN_QUANTITY
                     || line.quantity() > MAX_QUANTITY;
-            if (duplicate || badQuantity || line.lineId() == null || line.productId() == null) {
+            if (duplicateLineId || duplicateSku || badQuantity || line.lineId() == null || line.productId() == null) {
                 reasons.add(RejectionReason.line(RejectionCode.INVALID_REQUEST, storeId, line.sku()));
             }
         }
     }
 
-    /** A SKU that a reason may carry: at most 100 characters and no NUL (JSONB refuses U+0000). */
+    /**
+     * A SKU that a reason may carry: 1–100 code points, not blank, no NUL (Postgres text and JSONB refuse U+0000) and
+     * no unpaired surrogate.
+     */
     static boolean storable(String sku) {
-        return sku.length() <= MAX_SKU_LENGTH && sku.indexOf('\u0000') < 0;
+        return text(sku, MAX_SKU_LENGTH, true);
     }
 
     private static boolean validDelivery(PlaceCheckoutCmd.Delivery delivery) {
@@ -93,12 +113,32 @@ public class PlaceCheckoutValidator {
             return false;
         }
         PlaceCheckoutCmd.Address a = delivery.address();
-        return notBlank(a.line1()) && notBlank(a.city()) && a.country() != null && COUNTRY.matcher(a.country()).matches()
-                && notBlank(delivery.recipientName()) && delivery.recipientName().length() <= 255
-                && notBlank(delivery.phone()) && delivery.phone().length() <= 32;
+        return text(a.line1(), MAX_LINE1, true)
+                && text(a.line2(), MAX_LINE2, false)
+                && text(a.ward(), MAX_WARD, false)
+                && text(a.district(), MAX_DISTRICT, false)
+                && text(a.city(), MAX_CITY, true)
+                && a.country() != null && COUNTRY.matcher(a.country()).matches()
+                && text(a.postalCode(), MAX_POSTAL_CODE, false)
+                && text(delivery.recipientName(), MAX_RECIPIENT_NAME, true)
+                && text(delivery.phone(), MAX_PHONE, true);
     }
 
-    private static boolean notBlank(String value) {
-        return value != null && !value.isBlank();
+    /**
+     * A text field of the contract: absent only when optional (an optional field may also be empty); when required,
+     * not blank ({@link String#isBlank()}, i.e. {@link Character#isWhitespace}); at most {@code max} code points; no NUL
+     * and no unpaired surrogate ({@code codePoints()} yields a lone or reversed half as its own surrogate value).
+     */
+    static boolean text(String value, int max, boolean required) {
+        if (value == null) {
+            return !required;
+        }
+        if (required && value.isBlank()) {
+            return false;
+        }
+        if (value.codePointCount(0, value.length()) > max) {
+            return false;
+        }
+        return value.codePoints().noneMatch(c -> c == 0 || (c >= Character.MIN_SURROGATE && c <= Character.MAX_SURROGATE));
     }
 }

@@ -132,6 +132,31 @@ class PlaceCheckoutConsumerIT extends PostgresIT {
     }
 
     @Test
+    @DisplayName("a 100-code-point emoji SKU passes intake; unknown to the store → UNKNOWN_SKU with its text, stored and re-sent")
+    void emojiSkuUnknown() throws Exception {
+        String sku = "\uD83D\uDE00".repeat(100);
+        quotes = new StubQuotes(store -> new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", true, List.of(),
+                List.of(new OrderQuote.SkuQuote(sku, false, null, null, null, null)))));
+        UUID cart = UUID.randomUUID();
+        String value = message(cart, sku);
+        consume(cart, value);
+        consume(cart, value.replaceFirst("\"eventId\":\"[0-9a-f-]+\"", "\"eventId\":\"" + UUID.randomUUID() + "\""));
+
+        assertThat(count("SELECT count(*) FROM checkouts WHERE cart_id = ? AND status = 'REJECTED'", cart)).isEqualTo(1);
+        List<JsonNode> replies = replies();
+        assertThat(replies).hasSize(2);
+        for (JsonNode reply : replies) {
+            assertThat(ContractSchemaFiles.validate("CheckoutRejected", reply)).isEmpty();
+            assertThat(reply.get("reasons")).singleElement().satisfies(r -> {
+                assertThat(r.get("code").asText()).isEqualTo("UNKNOWN_SKU");
+                assertThat(r.get("sku").asText()).isEqualTo(sku);
+            });
+        }
+        assertThat(jdbc.queryForObject("SELECT reasons->0->>'sku' FROM checkouts WHERE cart_id = ?", String.class, cart))
+                .isEqualTo(sku);
+    }
+
+    @Test
     @DisplayName("two copies at once, same content: one row, two replies with the same reasons and checkoutId")
     void raceSameContent() throws Exception {
         CountDownLatch bothQuoting = new CountDownLatch(2);
