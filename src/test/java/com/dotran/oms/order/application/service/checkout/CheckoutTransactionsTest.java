@@ -1,7 +1,11 @@
 package com.dotran.oms.order.application.service.checkout;
 
+import com.dotran.oms.order.application.event.CheckoutReplyFactory;
 import com.dotran.oms.order.application.event.OutboxMessage;
+import com.dotran.oms.order.application.event.StockCommandFactory;
 import com.dotran.oms.order.application.repository.CheckoutRepository;
+import com.dotran.oms.order.application.repository.OrderRepository;
+import com.dotran.oms.order.application.repository.StoreDayCounterRepository;
 import com.dotran.oms.order.application.repository.OutboxEventRepository;
 import com.dotran.oms.order.application.repository.TransactionTimeoutRepository;
 import com.dotran.oms.order.domain.model.Checkout;
@@ -29,13 +33,16 @@ import static org.mockito.Mockito.when;
 class CheckoutTransactionsTest {
 
     @Mock private CheckoutRepository checkoutRepository;
+    @Mock private OrderRepository orderRepository;
+    @Mock private StoreDayCounterRepository counters;
     @Mock private OutboxEventRepository outboxEventRepository;
     @Mock private TransactionTimeoutRepository timeouts;
 
     @Test
     @DisplayName("storeOutcome: timeouts first, then the insert, then the reply; no reply when the insert lost")
     void storeOutcome() throws Exception {
-        CheckoutTransactions tx = new CheckoutTransactions(checkoutRepository, outboxEventRepository, timeouts);
+        CheckoutTransactions tx = new CheckoutTransactions(checkoutRepository, orderRepository, counters, outboxEventRepository, timeouts,
+                new StockCommandFactory(), new CheckoutReplyFactory());
         Checkout row = mock(Checkout.class);
         OutboxMessage reply = mock(OutboxMessage.class);
         when(checkoutRepository.insertIfAbsent(row)).thenReturn(true).thenReturn(false);
@@ -54,12 +61,20 @@ class CheckoutTransactionsTest {
         assertThat(annotation.timeout()).isEqualTo(5);
         assertThat(CheckoutTransactions.class.getMethod("publish", OutboxMessage.class)
                 .getAnnotation(Transactional.class).timeout()).isEqualTo(5);
+        // The PlaceCheckout poll sizing (200 s, application.yaml) counts on these two.
+        assertThat(CheckoutTransactions.class.getMethod("place",
+                com.dotran.oms.order.domain.valueobject.PlacementPlan.class, java.time.Instant.class)
+                .getAnnotation(Transactional.class).timeout()).isEqualTo(10);
+        assertThat(CheckoutTransactions.class.getMethod("republishPlaced", Checkout.class,
+                com.dotran.oms.core.domain.id.EventId.class, java.time.Instant.class)
+                .getAnnotation(Transactional.class).timeout()).isEqualTo(5);
     }
 
     @Test
     @DisplayName("publish: timeouts, then the reply; no checkout write")
     void publish() {
-        CheckoutTransactions tx = new CheckoutTransactions(checkoutRepository, outboxEventRepository, timeouts);
+        CheckoutTransactions tx = new CheckoutTransactions(checkoutRepository, orderRepository, counters, outboxEventRepository, timeouts,
+                new StockCommandFactory(), new CheckoutReplyFactory());
         OutboxMessage reply = mock(OutboxMessage.class);
         tx.publish(reply);
         verify(outboxEventRepository).saveAll(List.of(reply));

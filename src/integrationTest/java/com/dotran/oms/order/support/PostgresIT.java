@@ -4,11 +4,14 @@ import com.dotran.oms.core.logging.MdcProperties;
 import com.dotran.oms.core.logging.MdcPropagation;
 import com.dotran.oms.order.application.client.OrderQuoteClient;
 import com.dotran.oms.order.application.config.CheckoutProperties;
+import com.dotran.oms.order.application.config.StockSagaProperties;
 import com.dotran.oms.order.application.dto.quote.QuoteResult;
 import com.dotran.oms.order.application.event.CheckoutReplyFactory;
+import com.dotran.oms.order.application.event.StockCommandFactory;
 import com.dotran.oms.order.application.service.checkout.CheckoutTransactions;
 import com.dotran.oms.order.application.service.checkout.PlaceCheckoutService;
 import com.dotran.oms.order.application.service.checkout.PlaceCheckoutValidator;
+import com.dotran.oms.order.application.service.checkout.PlacementPlanner;
 import com.dotran.oms.order.application.service.checkout.QuoteReasonMapper;
 import com.dotran.oms.order.infrastructure.config.MessagingConfig;
 import com.dotran.oms.order.infrastructure.message.PlaceCheckoutConsumer;
@@ -40,15 +43,17 @@ import java.util.function.Function;
 
 /**
  * Base of the integration tests: one Postgres 16 container for the whole run (wal_level=logical, for {@link WalSlot}),
- * Flyway with the settings of application.yaml into schema {@code orders}, the JPA slice plus the persistence adapters,
- * the checkout services and the PlaceCheckout consumer. The order-quote client is a stub the test sets
- * ({@link #quotes}). No Kafka. Tests run without a surrounding transaction (each call commits); checkouts are truncated
- * before each test.
+ * Flyway with the settings of application.yaml (on the application DataSource) into schema {@code orders}, the JPA
+ * slice plus the persistence adapters, the checkout and stock saga services and the consumers. The order-quote client
+ * is a stub the test sets ({@link #quotes}). No Kafka, no scheduler. Tests run without a surrounding transaction (each
+ * call commits); every table is truncated before each test.
  */
 @DataJpaTest(showSql = false, properties = {
         "spring.jpa.hibernate.ddl-auto=none",
         "spring.jpa.show-sql=false",
-        "spring.jpa.properties.hibernate.show_sql=false"
+        "spring.jpa.properties.hibernate.show_sql=false",
+        // The jobs' services are called by the tests (no scheduler in this slice): no startup grace.
+        "app.stock.startup-grace=PT0S"
 })
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
@@ -78,10 +83,6 @@ public abstract class PostgresIT {
         registry.add("spring.datasource.url", () -> url);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
-        // application.yaml sets its own Flyway connection: override all three.
-        registry.add("spring.flyway.url", () -> url);
-        registry.add("spring.flyway.user", POSTGRES::getUsername);
-        registry.add("spring.flyway.password", POSTGRES::getPassword);
     }
 
     @Autowired
@@ -92,8 +93,13 @@ public abstract class PostgresIT {
 
     @BeforeEach
     void reset() {
-        jdbc.execute("TRUNCATE TABLE checkouts, outbox_events");
+        jdbc.execute("TRUNCATE TABLE order_transitions, order_lines, orders, store_day_counters, checkouts, outbox_events");
         quotes = new StubQuotes((store) -> StubQuotes.open());
+    }
+
+    /** Runs {@code work} in one committed transaction. A zero-argument lambda lets AssertJ pick the right overload. */
+    protected <T> T inTx(java.util.function.Supplier<T> work) {
+        return tx.execute(status -> work.get());
     }
 
     protected int count(String sql, Object... args) {
@@ -111,7 +117,7 @@ public abstract class PostgresIT {
 
         public static QuoteResult open() {
             return new QuoteResult.Ok(new com.dotran.oms.order.application.dto.quote.OrderQuote("ACTIVE", "VND", true,
-                    List.of(), List.of()));
+                    List.of(), List.of(), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null));
         }
 
         @Override
@@ -122,11 +128,22 @@ public abstract class PostgresIT {
 
     @TestConfiguration
     @ComponentScan(basePackages = "com.dotran.oms.order.infrastructure.persistence")
-    @EnableConfigurationProperties(CheckoutProperties.class)
+    @EnableConfigurationProperties({CheckoutProperties.class, StockSagaProperties.class})
     @Import({CheckoutTransactions.class, PlaceCheckoutService.class, PlaceCheckoutValidator.class,
-            QuoteReasonMapper.class, CheckoutReplyFactory.class, PlaceCheckoutConsumer.class, MessagingConfig.class,
-            MdcProperties.class, MdcPropagation.class})
+            QuoteReasonMapper.class, PlacementPlanner.class, CheckoutReplyFactory.class, StockCommandFactory.class,
+            PlaceCheckoutConsumer.class, MessagingConfig.class, MdcProperties.class, MdcPropagation.class,
+            com.dotran.oms.order.application.service.stock.StockSagaTransactions.class,
+            com.dotran.oms.order.application.service.stock.StockReplyService.class,
+            com.dotran.oms.order.application.service.stock.ReserveTimeoutService.class,
+            com.dotran.oms.order.application.service.stock.StockCommandResendService.class,
+            com.dotran.oms.order.infrastructure.message.StockReplyConsumers.class,
+            com.dotran.oms.order.infrastructure.metrics.MicrometerSagaMetrics.class})
     static class Config {
+
+        @Bean
+        io.micrometer.core.instrument.MeterRegistry meterRegistry() {
+            return new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        }
 
         @Bean
         Clock clock() {

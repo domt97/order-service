@@ -104,10 +104,11 @@ public class StoresOrderQuoteClient implements OrderQuoteClient {
         }
         List<OrderQuote.SkuQuote> skus = body.skus() == null ? List.of() : body.skus().stream()
                 .map(s -> new OrderQuote.SkuQuote(s.sku(), s.found(), s.productId(), s.status(), s.productStatus(),
-                        s.currency()))
+                        s.currency(), s.productName(), s.skuName(), s.price()))
                 .toList();
         return new QuoteResult.Ok(new OrderQuote(body.merchantStatus(), body.store().currency(), body.open(),
-                body.reasons(), skus));
+                body.reasons(), skus, body.store().code(), body.store().timeZone(), body.localDate(),
+                body.store().maxOrdersPerDay()));
     }
 
     /** Refused, no route, or the connect timeout (a SocketTimeoutException whose message names the connect). */

@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
  * Entry point of the PlaceCheckout command (ADR 0007), sent by cart-service's outbox, key cartId. Only maps and calls
  * the use case: it is idempotent by the checkout key and writes its reply to the outbox, so a business outcome is a
  * normal return and every exception goes to the error handler unchanged. Off unless
- * {@code app.kafka.place-checkout.enabled} (placement is not built yet).
+ * {@code app.kafka.place-checkout.enabled} (D1: off until the go-live gates are built).
  */
 @Component
 @RequiredArgsConstructor
@@ -34,7 +34,7 @@ public class PlaceCheckoutConsumer {
             topics = "PlaceCheckout",
             groupId = "order-place-checkout",
             autoStartup = "${app.kafka.place-checkout.enabled:false}",
-            // One record per poll: see app.kafka.place-checkout in application.yaml (worst case 170 s < 300 s).
+            // One record per poll: see app.kafka.place-checkout in application.yaml (worst case 200 s < 300 s).
             properties = "max.poll.records=1"
     )
     public void consume(ConsumerRecord<String, String> record) throws JsonProcessingException {

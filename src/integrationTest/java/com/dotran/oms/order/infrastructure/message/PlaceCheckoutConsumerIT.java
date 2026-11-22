@@ -70,15 +70,24 @@ class PlaceCheckoutConsumerIT extends PostgresIT {
 
     private static QuoteResult closed() {
         return new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", false, List.of("OUTSIDE_HOURS"),
-                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND"))));
+                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"))), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null));
     }
 
+    /** The CheckoutRejected / CheckoutPlaced rows as Debezium would read them. */
     private List<JsonNode> replies() throws Exception {
+        return outbox(wal.changes(), "CheckoutRejected", "CheckoutPlaced");
+    }
+
+    /** Outbox inserts of the given types among {@code changes} (WalSlot.changes() consumes the slot: read it once). */
+    private static List<JsonNode> outbox(List<WalSlot.Change> changes, String... types) throws Exception {
         List<JsonNode> out = new java.util.ArrayList<>();
-        for (WalSlot.Change change : wal.changes()) {
+        for (WalSlot.Change change : changes) {
             if (change.isOutbox() && "INSERT".equals(change.op())) {
-                assertThat(change.data()).contains("event_type[character varying]:'CheckoutRejected'");
-                out.add(JSON.readTree(change.payload()));
+                for (String type : types) {
+                    if (change.data().contains("event_type[character varying]:'" + type + "'")) {
+                        out.add(JSON.readTree(change.payload()));
+                    }
+                }
             }
         }
         return out;
@@ -108,14 +117,30 @@ class PlaceCheckoutConsumerIT extends PostgresIT {
     }
 
     @Test
-    @DisplayName("an open store and a matching SKU → nothing stored, nothing sent (placement not built)")
-    void passedNotPlaced() throws Exception {
+    @DisplayName("an open store and a matching SKU → PENDING checkout, one order, one ReserveStock in the WAL, no reply")
+    void placementStarted() throws Exception {
         quotes = new StubQuotes(store -> new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", true, List.of(),
-                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND")))));
+                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"))), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null)));
         UUID cart = UUID.randomUUID();
         consume(cart, message(cart, "TS-M"));
-        assertThat(count("SELECT count(*) FROM checkouts WHERE cart_id = ?", cart)).isZero();
-        assertThat(replies()).isEmpty();
+        assertThat(count("SELECT count(*) FROM checkouts WHERE cart_id = ? AND status = 'PENDING'", cart)).isEqualTo(1);
+        assertThat(count("SELECT count(*) FROM orders o JOIN checkouts c ON c.id = o.checkout_id "
+                + "WHERE c.cart_id = ? AND o.status = 'PENDING' AND o.stock_state = 'RESERVE_SENT'", cart)).isEqualTo(1);
+        List<WalSlot.Change> changes = wal.changes();
+        assertThat(outbox(changes, "CheckoutRejected", "CheckoutPlaced")).isEmpty();
+        List<JsonNode> reserves = outbox(changes, "ReserveStock");
+        assertThat(reserves).singleElement().satisfies(r -> {
+            assertThat(ContractSchemaFiles.validate("ReserveStock", r)).isEmpty();
+            assertThat(r.get("storeId").asText()).isEqualTo(STORE.toString());
+            assertThat(r.toString()).doesNotContain("Nguyen", "0901234567", "Le Loi");
+        });
+        assertThat(changes.stream().filter(c -> c.isOutbox() && "INSERT".equals(c.op())))
+                .singleElement().satisfies(c -> assertThat(c.data())
+                        .contains("merchant_id[uuid]:'00000000-0000-0000-0000-00000000a001'"));
+
+        // A copy while PENDING: nothing new written or sent.
+        consume(cart, message(cart, "TS-M")); // new eventId, same content
+        assertThat(count("SELECT count(*) FROM orders")).isEqualTo(1);
     }
 
     @Test
@@ -136,7 +161,7 @@ class PlaceCheckoutConsumerIT extends PostgresIT {
     void emojiSkuUnknown() throws Exception {
         String sku = "\uD83D\uDE00".repeat(100);
         quotes = new StubQuotes(store -> new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", true, List.of(),
-                List.of(new OrderQuote.SkuQuote(sku, false, null, null, null, null)))));
+                List.of(new OrderQuote.SkuQuote(sku, false, null, null, null, null, null, null, null)), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null)));
         UUID cart = UUID.randomUUID();
         String value = message(cart, sku);
         consume(cart, value);
