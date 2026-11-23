@@ -4,6 +4,9 @@ import com.dotran.oms.core.domain.id.EventId;
 import com.dotran.oms.order.application.client.OrderQuoteClient;
 import com.dotran.oms.order.application.command.checkout.PlaceCheckoutCmd;
 import com.dotran.oms.order.application.config.CheckoutProperties;
+import com.dotran.oms.order.application.config.StockSagaProperties;
+import com.dotran.oms.order.application.service.checkout.CheckoutTransactions.PlaceResult;
+import com.dotran.oms.order.domain.valueobject.PlacementPlan;
 import com.dotran.oms.order.application.dto.quote.OrderQuote;
 import com.dotran.oms.order.application.dto.quote.QuoteResult;
 import com.dotran.oms.order.application.event.CheckoutRejectedEvent;
@@ -61,23 +64,24 @@ class PlaceCheckoutServiceTest {
         CheckoutProperties properties = new CheckoutProperties(Duration.ofMinutes(10), Duration.ofSeconds(30),
                 Duration.ofSeconds(20));
         service = new PlaceCheckoutService(checkoutRepository, transactions, new PlaceCheckoutValidator(properties),
-                new QuoteReasonMapper(), orderQuoteClient, new CheckoutReplyFactory(), properties, clock);
+                new QuoteReasonMapper(), orderQuoteClient, new CheckoutReplyFactory(), new PlacementPlanner(),
+                properties, StockSagaProperties.defaults(), clock);
     }
 
     private static QuoteResult closedStore() {
         return new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", false, List.of("OUTSIDE_HOURS"),
-                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND"))));
+                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"))), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null));
     }
 
     private static QuoteResult openStore() {
         return new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", true, List.of(),
-                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND"))));
+                List.of(new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"))), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null));
     }
 
     private static Checkout stored(PlaceCheckoutCmd cmd, CheckoutStatus status, RejectionCode code) {
         return new Checkout(CheckoutId.newId(), cmd.customerId(), cmd.cartId(), cmd.cartVersion(), status,
                 ContentHash.of(cmd), List.of(RejectionReason.store(code, STORE)), EventId.of(UUID.randomUUID()),
-                cmd.requestedAt(), NOW.minusSeconds(60));
+                cmd.requestedAt(), NOW.minusSeconds(60), null, null, NOW.minusSeconds(60));
     }
 
     private static CheckoutRejectedEvent payload(OutboxMessage message) {
@@ -110,15 +114,102 @@ class PlaceCheckoutServiceTest {
     }
 
     @Test
-    @DisplayName("every check passes: nothing stored, nothing sent (placement not built yet)")
-    void passedNotPlaced() {
+    @DisplayName("every check passes: placement with a PENDING checkout (due in 150 s) and one priced order per store")
+    void placementStarted() {
         PlaceCheckoutCmd cmd = Checkouts.valid().build();
         when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.empty());
         when(orderQuoteClient.quote(any(), any(), anyList(), any())).thenReturn(openStore());
+        when(transactions.place(any(), any())).thenReturn(PlaceResult.PLACEMENT_STARTED);
 
-        assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.PASSED_NOT_PLACED);
+        assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.PLACEMENT_STARTED);
+        ArgumentCaptor<PlacementPlan> plan = ArgumentCaptor.forClass(PlacementPlan.class);
+        verify(transactions).place(plan.capture(), eq(NOW));
+        assertThat(plan.getValue().checkout().status()).isEqualTo(CheckoutStatus.PENDING);
+        assertThat(plan.getValue().checkout().reserveDueAt()).isEqualTo(NOW.plusSeconds(150));
+        assertThat(plan.getValue().checkout().causationId()).isEqualTo(cmd.eventId());
+        assertThat(plan.getValue().orders()).singleElement().satisfies(o -> {
+            assertThat(o.storeCode()).isEqualTo("HCM01");
+            assertThat(o.localDate()).isEqualTo(java.time.LocalDate.of(2026, 11, 16));
+            assertThat(o.itemsTotal()).isEqualByComparingTo("25000");
+            assertThat(o.lines()).singleElement().satisfies(l -> {
+                assertThat(l.productName()).isEqualTo("Tee");
+                assertThat(l.unitPrice()).isEqualByComparingTo("25000");
+                assertThat(l.cartLineId()).isEqualTo(cmd.stores().get(0).lines().get(0).lineId());
+            });
+            assertThat(o.deliveryQuoteId()).isEqualTo(cmd.stores().get(0).quoteId());
+        });
         verify(transactions, never()).storeOutcome(any(), any());
         verify(transactions, never()).publish(any());
+    }
+
+    @Test
+    @DisplayName("daily cap reached: REJECTED with DAILY_CAP_REACHED for the capped store only")
+    void dailyCap() {
+        UUID other = UUID.fromString("00000000-0000-0000-0000-00000000b002");
+        PlaceCheckoutCmd cmd = Checkouts.valid().stores(List.of(store(STORE, line("TS-M")), store(other, line("TS-M"))))
+                .build();
+        when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.empty());
+        when(orderQuoteClient.quote(any(), any(), anyList(), any())).thenReturn(openStore());
+        when(transactions.place(any(), any())).thenThrow(new DailyCapReached(List.of(other)));
+        when(transactions.storeOutcome(any(), any())).thenReturn(true);
+
+        assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.REJECTED_STORED);
+        ArgumentCaptor<Checkout> row = ArgumentCaptor.forClass(Checkout.class);
+        verify(transactions).storeOutcome(row.capture(), any());
+        assertThat(row.getValue().reasons()).containsExactly(
+                RejectionReason.store(RejectionCode.DAILY_CAP_REACHED, other));
+    }
+
+    @Test
+    @DisplayName("placement lost the key: re-read; a PENDING row of the same content → IN_PROGRESS, nothing sent")
+    void keyTaken() {
+        PlaceCheckoutCmd cmd = Checkouts.valid().build();
+        Checkout pending = Checkout.pending(cmd.customerId(), cmd.cartId(), 3, ContentHash.of(cmd),
+                EventId.of(UUID.randomUUID()), cmd.requestedAt(), NOW, NOW.plusSeconds(150));
+        when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.empty())
+                .thenReturn(Optional.of(pending));
+        when(orderQuoteClient.quote(any(), any(), anyList(), any())).thenReturn(openStore());
+        when(transactions.place(any(), any())).thenReturn(PlaceResult.KEY_TAKEN);
+
+        assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.IN_PROGRESS);
+        verify(transactions, times(1)).place(any(), any());
+        verify(transactions, never()).publish(any());
+        verify(transactions, never()).storeOutcome(any(), any());
+    }
+
+    @Test
+    @DisplayName("a PLACED row, same content: CheckoutPlaced sent again with the new command as causation")
+    void republishPlaced() {
+        PlaceCheckoutCmd cmd = Checkouts.valid().build();
+        Checkout placed = new Checkout(CheckoutId.newId(), cmd.customerId(), cmd.cartId(), 3, CheckoutStatus.PLACED,
+                ContentHash.of(cmd), null, EventId.of(UUID.randomUUID()), cmd.requestedAt(), NOW.minusSeconds(60),
+                NOW.plusSeconds(90), NOW.minusSeconds(30), NOW.minusSeconds(30));
+        when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.of(placed));
+
+        assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.REPUBLISHED);
+        verify(transactions).republishPlaced(placed, cmd.eventId(), NOW);
+        verify(transactions, never()).place(any(), any());
+        verify(orderQuoteClient, never()).quote(any(), any(), anyList(), any());
+    }
+
+    @Test
+    @DisplayName("a store code outside [A-Z0-9]{1,20}, a null or negative price: stored REJECTED, place never called")
+    void notSnapshottable() {
+        when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.empty());
+        when(transactions.storeOutcome(any(), any())).thenReturn(true);
+        when(orderQuoteClient.quote(any(), any(), anyList(), any())).thenReturn(
+                new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", true, List.of(), List.of(
+                        new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M",
+                                new java.math.BigDecimal("25000"))), "q-1", "Asia/Ho_Chi_Minh",
+                        java.time.LocalDate.of(2026, 11, 16), null)),
+                new QuoteResult.Ok(new OrderQuote("ACTIVE", "VND", true, List.of(), List.of(
+                        new OrderQuote.SkuQuote("TS-M", true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M",
+                                new java.math.BigDecimal("-1"))), "HCM01", "Asia/Ho_Chi_Minh",
+                        java.time.LocalDate.of(2026, 11, 16), null)));
+        assertThat(service.place(Checkouts.valid().build())).isEqualTo(PlaceCheckoutOutcome.REJECTED_STORED);
+        assertThat(service.place(Checkouts.valid().cartVersion(4).build()))
+                .isEqualTo(PlaceCheckoutOutcome.REJECTED_STORED);
+        verify(transactions, never()).place(any(), any());
     }
 
     @Test
@@ -164,8 +255,9 @@ class PlaceCheckoutServiceTest {
     void stale() {
         when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.empty());
         when(orderQuoteClient.quote(any(), any(), anyList(), any())).thenReturn(openStore());
+        when(transactions.place(any(), any())).thenReturn(PlaceResult.PLACEMENT_STARTED);
         assertThat(service.place(Checkouts.valid().requestedAt(NOW.minus(Duration.ofMinutes(10))).build()))
-                .isEqualTo(PlaceCheckoutOutcome.PASSED_NOT_PLACED);
+                .isEqualTo(PlaceCheckoutOutcome.PLACEMENT_STARTED);
 
         when(transactions.storeOutcome(any(), any())).thenReturn(true);
         assertThat(service.place(Checkouts.valid().requestedAt(NOW.minus(Duration.ofMinutes(10)).minusSeconds(1)).build()))
@@ -301,11 +393,11 @@ class PlaceCheckoutServiceTest {
     }
 
     @Test
-    @DisplayName("a PENDING row (cannot exist yet): nothing sent")
+    @DisplayName("a PENDING row (placement waiting for inventory): nothing sent")
     void inProgress() {
         PlaceCheckoutCmd cmd = Checkouts.valid().build();
-        Checkout pending = new Checkout(CheckoutId.newId(), cmd.customerId(), cmd.cartId(), 3, CheckoutStatus.PENDING,
-                ContentHash.of(cmd), null, EventId.of(UUID.randomUUID()), cmd.requestedAt(), NOW);
+        Checkout pending = Checkout.pending(cmd.customerId(), cmd.cartId(), 3, ContentHash.of(cmd),
+                EventId.of(UUID.randomUUID()), cmd.requestedAt(), NOW, NOW.plusSeconds(150));
         when(checkoutRepository.findByKey(any(), eq(3L), any())).thenReturn(Optional.of(pending));
         assertThat(service.place(cmd)).isEqualTo(PlaceCheckoutOutcome.IN_PROGRESS);
         verify(transactions, never()).publish(any());

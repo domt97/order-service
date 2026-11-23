@@ -45,6 +45,9 @@ class KafkaErrorHandlingConfigTest {
         assertThat(KafkaErrorHandlingConfig.describe(new InvalidPlaceCheckoutMessageException("cartId missing or not a UUID")))
                 .isEqualTo("InvalidPlaceCheckoutMessageException: cartId missing or not a UUID");
         assertThat(KafkaErrorHandlingConfig.hasParseError(new IllegalStateException("x"))).isFalse();
+        assertThat(KafkaErrorHandlingConfig.describe(
+                new com.dotran.oms.order.application.service.stock.InvalidStockReplyException("orderId missing")))
+                .isEqualTo("InvalidStockReplyException: orderId missing");
     }
 
     @Test
@@ -55,6 +58,8 @@ class KafkaErrorHandlingConfigTest {
         assertThat(handler.removeClassification(JsonProcessingException.class)).isFalse();
         assertThat(handler.removeClassification(InvalidPlaceCheckoutMessageException.class)).isFalse();
         assertThat(handler.removeClassification(DataIntegrityViolationException.class)).isFalse();
+        assertThat(handler.removeClassification(
+                com.dotran.oms.order.application.service.stock.InvalidStockReplyException.class)).isFalse();
         assertThat(KafkaErrorHandlingConfig.isConnectionFailure(new DataAccessResourceFailureException("down"))).isTrue();
         assertThat(KafkaErrorHandlingConfig.isConnectionFailure(new DataAccessResourceFailureException("cancelled",
                 new SQLException("canceling statement", "57014")))).isFalse();

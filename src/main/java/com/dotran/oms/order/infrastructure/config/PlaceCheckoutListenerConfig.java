@@ -11,8 +11,8 @@ import org.springframework.context.event.EventListener;
 import org.springframework.kafka.config.TopicBuilder;
 
 /**
- * Only when the PlaceCheckout listener is on: its dead-letter topic (with the flag off, no topic bean exists and
- * startup never contacts a broker) and a WARN that placement is not built yet.
+ * Only when the PlaceCheckout listener is on: its dead-letter topic and a WARN that the go-live gates are not built
+ * yet (D1).
  */
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnProperty(name = "app.kafka.place-checkout.enabled", havingValue = "true")
@@ -26,8 +26,8 @@ public class PlaceCheckoutListenerConfig {
     }
 
     @EventListener(ApplicationReadyEvent.class)
-    public void warnPlacementNotBuilt() {
-        log.warn("PlaceCheckout listener is ON, but placement is not built yet: a checkout that passes every check gets"
-                + " no reply. Use only to test rejections.");
+    public void warnGoLiveGatesPending() {
+        log.warn("PlaceCheckout listener is ON, but acceptance, cancel and delivery are not built yet: a placed order "
+                + "keeps its stock sold and nothing can accept or cancel it. Use only for local tests.");
     }
 }

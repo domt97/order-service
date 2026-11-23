@@ -13,11 +13,12 @@ import java.util.Objects;
 
 /**
  * The outcome stored under a checkout key (cart id + cart version, BR-ORD-05). Customer-owned (system rule 4). The
- * content hash decides whether a later command with the same key is the same checkout.
+ * content hash decides whether a later command with the same key is the same checkout. A PENDING checkout (placement
+ * started, waiting for inventory's replies) carries {@code reserveDueAt}: the reserve-timeout job decides it then.
  */
 public record Checkout(CheckoutId id, CustomerId customerId, CartId cartId, long cartVersion, CheckoutStatus status,
                        String contentHash, List<RejectionReason> reasons, EventId causationId, Instant requestedAt,
-                       Instant createdAt) {
+                       Instant createdAt, Instant reserveDueAt, Instant placedAt, Instant updatedAt) {
 
     public Checkout {
         Objects.requireNonNull(id, "id");
@@ -30,6 +31,16 @@ public record Checkout(CheckoutId id, CustomerId customerId, CartId cartId, long
         if (isRejectedOutcome(status) && (reasons == null || reasons.isEmpty())) {
             throw new IllegalArgumentException(status + " checkout needs at least one reason");
         }
+        if (status == CheckoutStatus.PENDING && reserveDueAt == null) {
+            throw new IllegalArgumentException("A PENDING checkout needs reserveDueAt");
+        }
+    }
+
+    /** Placement started: PENDING until every store's reserve is answered or {@code reserveDueAt} passes (D3). */
+    public static Checkout pending(CustomerId customerId, CartId cartId, long cartVersion, String contentHash,
+                                   EventId causationId, Instant requestedAt, Instant now, Instant reserveDueAt) {
+        return new Checkout(CheckoutId.newId(), customerId, cartId, cartVersion, CheckoutStatus.PENDING, contentHash,
+                null, causationId, requestedAt, now, reserveDueAt, null, now);
     }
 
     /** A new rejected (REJECTED or STALE) outcome with a random id. */
@@ -40,12 +51,16 @@ public record Checkout(CheckoutId id, CustomerId customerId, CartId cartId, long
             throw new IllegalArgumentException("Not a rejected status: " + status);
         }
         return new Checkout(CheckoutId.newId(), customerId, cartId, cartVersion, status, contentHash,
-                RejectionReason.normalise(reasons), causationId, requestedAt, now);
+                RejectionReason.normalise(reasons), causationId, requestedAt, now, null, null, now);
     }
 
     /** REJECTED, STALE and EXPIRED answer every copy of the command with their stored reasons. */
     public boolean answersWithRejection() {
         return isRejectedOutcome(status);
+    }
+
+    public boolean isPlaced() {
+        return status == CheckoutStatus.PLACED;
     }
 
     public boolean sameContent(String hash) {

@@ -45,4 +45,28 @@ class CoreProfileConfigTest {
             assertThat(env.getProperty("spring.flyway.baseline-on-migrate")).isNull();
         });
     }
+
+    @Test
+    @DisplayName("BR-ORD-15: server error detail off; Flyway has no connection of its own (it uses the DataSource)")
+    void noServerErrorDetail() {
+        runner.run(context -> {
+            Environment env = context.getEnvironment();
+            assertThat(env.getProperty("spring.datasource.hikari.data-source-properties.logServerErrorDetail"))
+                    .isEqualTo("false");
+            assertThat(env.getProperty("spring.flyway.url")).isNull();
+            assertThat(env.getProperty("spring.flyway.user")).isNull();
+            assertThat(env.getProperty("spring.flyway.password")).isNull();
+        });
+    }
+
+    @Test
+    @DisplayName("pool 15, scheduler pool 2 (one per job), actuator exposes health and metrics only")
+    void poolsAndActuator() {
+        runner.run(context -> {
+            Environment env = context.getEnvironment();
+            assertThat(env.getProperty("spring.datasource.hikari.maximum-pool-size")).isEqualTo("15");
+            assertThat(env.getProperty("spring.task.scheduling.pool.size")).isEqualTo("2");
+            assertThat(env.getProperty("management.endpoints.web.exposure.include")).isEqualTo("health,metrics");
+        });
+    }
 }

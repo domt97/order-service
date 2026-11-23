@@ -3,6 +3,8 @@ package com.dotran.oms.order.infrastructure.config;
 import com.dotran.oms.core.logging.LogSanitizer;
 import com.dotran.oms.core.logging.MdcPropagation;
 import com.dotran.oms.core.logging.MdcScope;
+import com.dotran.oms.order.application.service.stock.InvalidStockReplyException;
+import com.dotran.oms.order.application.support.DbFailures;
 import com.dotran.oms.order.infrastructure.message.InvalidPlaceCheckoutMessageException;
 import com.dotran.oms.order.infrastructure.message.KafkaMdc;
 import com.fasterxml.jackson.core.JsonLocation;
@@ -11,18 +13,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.dao.TransientDataAccessResourceException;
 import org.springframework.kafka.core.KafkaOperations;
 import org.springframework.kafka.listener.ConsumerRecordRecoverer;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
-import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.util.backoff.ExponentialBackOff;
 
-import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -39,7 +37,6 @@ public class KafkaErrorHandlingConfig {
     static final String DLT_SUFFIX = ".DLT";
     static final int MAX_RETRIES = 6;
     static final long CONNECTION_FAILURE_MAX_INTERVAL_MS = 60_000L;
-    private static final String QUERY_CANCELED = "57014";
 
     @Bean
     public DefaultErrorHandler kafkaErrorHandler(KafkaOperations<?, ?> kafkaTemplate, MdcPropagation mdcPropagation) {
@@ -70,6 +67,7 @@ public class KafkaErrorHandlingConfig {
         handler.addNotRetryableExceptions(
                 JsonProcessingException.class,
                 InvalidPlaceCheckoutMessageException.class,
+                InvalidStockReplyException.class,
                 DataIntegrityViolationException.class);
         return handler;
     }
@@ -93,7 +91,8 @@ public class KafkaErrorHandlingConfig {
                 if (at != null) {
                     part += " at line " + at.getLineNr() + " column " + at.getColumnNr();
                 }
-            } else if (cause instanceof InvalidPlaceCheckoutMessageException) {
+            } else if (cause instanceof InvalidPlaceCheckoutMessageException
+                    || cause instanceof InvalidStockReplyException) {
                 // Names the field only, never its value.
                 part += ": " + cause.getMessage();
             }
@@ -102,20 +101,9 @@ public class KafkaErrorHandlingConfig {
         return String.join(" <- ", parts);
     }
 
-    /** As inventory-service: a cancelled statement (57014) is a timeout, not a connection failure. */
+    /** Delegates to {@link DbFailures#isConnectionFailure} (shared with the saga jobs). */
     static boolean isConnectionFailure(Throwable exception) {
-        boolean connectionFailure = false;
-        for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SQLException sql && QUERY_CANCELED.equals(sql.getSQLState())) {
-                return false;
-            }
-            if (cause instanceof DataAccessResourceFailureException
-                    || cause instanceof TransientDataAccessResourceException
-                    || cause instanceof CannotCreateTransactionException) {
-                connectionFailure = true;
-            }
-        }
-        return connectionFailure;
+        return DbFailures.isConnectionFailure(exception);
     }
 
     static ExponentialBackOff connectionFailureBackOff() {

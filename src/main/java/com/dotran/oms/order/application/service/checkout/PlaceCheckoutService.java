@@ -4,9 +4,12 @@ import com.dotran.oms.core.annotation.UseCase;
 import com.dotran.oms.order.application.client.OrderQuoteClient;
 import com.dotran.oms.order.application.command.checkout.PlaceCheckoutCmd;
 import com.dotran.oms.order.application.config.CheckoutProperties;
+import com.dotran.oms.order.application.config.StockSagaProperties;
+import com.dotran.oms.order.application.dto.quote.OrderQuote;
 import com.dotran.oms.order.application.dto.quote.QuoteResult;
 import com.dotran.oms.order.application.event.CheckoutReplyFactory;
 import com.dotran.oms.order.application.repository.CheckoutRepository;
+import com.dotran.oms.order.application.service.checkout.CheckoutTransactions.PlaceResult;
 import com.dotran.oms.order.application.usecase.checkout.PlaceCheckoutUseCase;
 import com.dotran.oms.order.domain.enums.CheckoutStatus;
 import com.dotran.oms.order.domain.enums.RejectionCode;
@@ -19,8 +22,11 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Checkout intake (ADR 0007), pre-reserve part. Order of the steps:
@@ -30,10 +36,12 @@ import java.util.Optional;
  *   <li>contract rules → INVALID_REQUEST;</li>
  *   <li>no row and requestedAt older than the STALE window → STALE;</li>
  *   <li>one order-quote per store (outside any transaction, within the quote budget) → BR-ORD-02 reasons;</li>
- *   <li>any reason → the row and its CheckoutRejected in one transaction; a lost insert re-reads the key.</li>
+ *   <li>any reason → the row and its CheckoutRejected in one transaction; a lost insert re-reads the key;</li>
+ *   <li>no reason → placement: the PENDING checkout, one order per store and one ReserveStock each, then the daily
+ *       slots, in one transaction; a capped store → REJECTED with DAILY_CAP_REACHED; a lost insert re-reads the key.
+ *       Inventory's replies decide the checkout (PLACED or REJECTED) later.</li>
  * </ol>
- * A checkout that passes every check is not placed yet (decided 2026-11-16: placement is the next PR). Not
- * {@code @Transactional}: the quote calls must not hold a connection; {@link CheckoutTransactions} writes.
+ * Not {@code @Transactional}: the quote calls must not hold a connection; {@link CheckoutTransactions} writes.
  */
 @UseCase
 @RequiredArgsConstructor
@@ -49,7 +57,9 @@ public class PlaceCheckoutService implements PlaceCheckoutUseCase {
     private final QuoteReasonMapper quoteReasonMapper;
     private final OrderQuoteClient orderQuoteClient;
     private final CheckoutReplyFactory replies;
+    private final PlacementPlanner planner;
     private final CheckoutProperties properties;
+    private final StockSagaProperties stockProperties;
     private final Clock clock;
 
     @Override
@@ -69,12 +79,16 @@ public class PlaceCheckoutService implements PlaceCheckoutUseCase {
             reasons = List.of(RejectionReason.checkout(RejectionCode.STALE));
         }
         if (reasons.isEmpty()) {
-            reasons = quoteAll(cmd);
-        }
-        if (reasons.isEmpty()) {
-            log.info("Checkout passed the pre-reserve checks; placement is not built yet: cartId={} cartVersion={}",
-                    cmd.cartId().getValue(), cmd.cartVersion());
-            return PlaceCheckoutOutcome.PASSED_NOT_PLACED;
+            Quoted quoted = quoteAll(cmd);
+            reasons = quoted.reasons();
+            if (reasons.isEmpty()) {
+                try {
+                    return startPlacement(cmd, hash, quoted.quotes(), now);
+                } catch (DailyCapReached e) {
+                    reasons = e.storeIds().stream()
+                            .map(store -> RejectionReason.store(RejectionCode.DAILY_CAP_REACHED, store)).toList();
+                }
+            }
         }
 
         Checkout candidate = Checkout.rejected(status, cmd.customerId(), cmd.cartId(), cmd.cartVersion(), hash,
@@ -91,13 +105,36 @@ public class PlaceCheckoutService implements PlaceCheckoutUseCase {
                 .orElseGet(() -> contentMismatch(cmd));
     }
 
+    private PlaceCheckoutOutcome startPlacement(PlaceCheckoutCmd cmd, String hash, Map<UUID, OrderQuote> quotes,
+                                                Instant now) {
+        Checkout pending = Checkout.pending(cmd.customerId(), cmd.cartId(), cmd.cartVersion(), hash, cmd.eventId(),
+                cmd.requestedAt(), now, now.plus(stockProperties.reserveTimeout()));
+        PlaceResult result = transactions.place(planner.plan(pending, cmd, quotes, now), now);
+        if (result == PlaceResult.PLACEMENT_STARTED) {
+            log.info("Checkout placement started: cartId={} cartVersion={} checkoutId={} stores={}",
+                    cmd.cartId().getValue(), cmd.cartVersion(), pending.id().getValue(), cmd.stores().size());
+            return PlaceCheckoutOutcome.PLACEMENT_STARTED;
+        }
+        // Another copy stored the key first (or the key is another customer's): re-read for this customer.
+        return checkoutRepository.findByKey(cmd.cartId(), cmd.cartVersion(), cmd.customerId())
+                .map(row -> resolveExisting(row, cmd, hash))
+                .orElseGet(() -> contentMismatch(cmd));
+    }
+
     private PlaceCheckoutOutcome resolveExisting(Checkout row, PlaceCheckoutCmd cmd, String hash) {
         if (!row.sameContent(hash)) {
             return contentMismatch(cmd);
         }
+        if (row.isPlaced()) {
+            transactions.republishPlaced(row, cmd.eventId(), clock.instant());
+            log.info("CheckoutPlaced sent again: cartId={} cartVersion={} checkoutId={}",
+                    cmd.cartId().getValue(), cmd.cartVersion(), row.id().getValue());
+            return PlaceCheckoutOutcome.REPUBLISHED;
+        }
         if (!row.answersWithRejection()) {
-            log.warn("Checkout key already {} (placement not built yet): cartId={} cartVersion={}; nothing sent",
-                    row.status(), cmd.cartId().getValue(), cmd.cartVersion());
+            // PENDING: inventory's replies (or the reserve timeout) decide it and send the reply then.
+            log.info("Checkout key already {}: cartId={} cartVersion={} checkoutId={}; nothing sent",
+                    row.status(), cmd.cartId().getValue(), cmd.cartVersion(), row.id().getValue());
             return PlaceCheckoutOutcome.IN_PROGRESS;
         }
         transactions.publish(replies.rejected(cmd, row.id(), row.reasons(), clock.instant()));
@@ -113,9 +150,11 @@ public class PlaceCheckoutService implements PlaceCheckoutUseCase {
         return PlaceCheckoutOutcome.CONTENT_MISMATCH;
     }
 
-    private List<RejectionReason> quoteAll(PlaceCheckoutCmd cmd) {
+    /** Every store's reasons, and the quotes that answered Ok (placement snapshots them). */
+    private Quoted quoteAll(PlaceCheckoutCmd cmd) {
         Instant deadline = clock.instant().plus(properties.quoteBudget());
         List<RejectionReason> reasons = new ArrayList<>();
+        Map<UUID, OrderQuote> quotes = new HashMap<>();
         for (PlaceCheckoutCmd.Store store : cmd.stores()) {
             Duration left = Duration.between(clock.instant(), deadline);
             QuoteResult result = left.compareTo(MIN_CALL_TIME) < 0
@@ -130,8 +169,14 @@ public class PlaceCheckoutService implements PlaceCheckoutUseCase {
                 log.warn("order-quote unavailable: merchantId={} storeId={} ({}); STORE_UNAVAILABLE",
                         store.merchantId(), store.storeId(), unavailable.why());
             }
+            if (result instanceof QuoteResult.Ok ok) {
+                quotes.put(store.storeId(), ok.quote());
+            }
             reasons.addAll(quoteReasonMapper.reasons(store, result));
         }
-        return RejectionReason.normalise(reasons);
+        return new Quoted(RejectionReason.normalise(reasons), quotes);
+    }
+
+    private record Quoted(List<RejectionReason> reasons, Map<UUID, OrderQuote> quotes) {
     }
 }

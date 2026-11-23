@@ -24,11 +24,11 @@ class QuoteReasonMapperTest {
     private final PlaceCheckoutCmd.Store store = store(STORE, line("A"));
 
     private static OrderQuote.SkuQuote sku(String code) {
-        return new OrderQuote.SkuQuote(code, true, PRODUCT, "ACTIVE", "ACTIVE", "VND");
+        return new OrderQuote.SkuQuote(code, true, PRODUCT, "ACTIVE", "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"));
     }
 
     private static QuoteResult ok(String merchant, boolean open, List<String> reasons, OrderQuote.SkuQuote... skus) {
-        return new QuoteResult.Ok(new OrderQuote(merchant, "VND", open, reasons, List.of(skus)));
+        return new QuoteResult.Ok(new OrderQuote(merchant, "VND", open, reasons, List.of(skus), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null));
     }
 
     private List<RejectionCode> codes(QuoteResult result) {
@@ -66,27 +66,27 @@ class QuoteReasonMapperTest {
     void unknownSku() {
         RejectionReason unknownA = RejectionReason.line(RejectionCode.UNKNOWN_SKU, STORE, "A");
         assertThat(mapper.reasons(store, ok("ACTIVE", true, List.of(),
-                new OrderQuote.SkuQuote("A", false, null, null, null, null)))).containsExactly(unknownA);
+                new OrderQuote.SkuQuote("A", false, null, null, null, null, null, null, null)))).containsExactly(unknownA);
         assertThat(mapper.reasons(store, ok("ACTIVE", true, List.of()))).containsExactly(unknownA);
         assertThat(mapper.reasons(store, ok("ACTIVE", true, List.of(),
-                new OrderQuote.SkuQuote("A", true, UUID.randomUUID(), "ACTIVE", "ACTIVE", "VND")))).containsExactly(unknownA);
+                new OrderQuote.SkuQuote("A", true, UUID.randomUUID(), "ACTIVE", "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"))))).containsExactly(unknownA);
     }
 
     @Test
     @DisplayName("SKU or product not ACTIVE → PRODUCT_INACTIVE")
     void productInactive() {
         assertThat(codes(ok("ACTIVE", true, List.of(), new OrderQuote.SkuQuote("A", true, PRODUCT, "INACTIVE",
-                "ACTIVE", "VND")))).containsExactly(RejectionCode.PRODUCT_INACTIVE);
+                "ACTIVE", "VND", "Tee", "M", new java.math.BigDecimal("25000"))))).containsExactly(RejectionCode.PRODUCT_INACTIVE);
         assertThat(codes(ok("ACTIVE", true, List.of(), new OrderQuote.SkuQuote("A", true, PRODUCT, "ACTIVE",
-                "DRAFT", "VND")))).containsExactly(RejectionCode.PRODUCT_INACTIVE);
+                "DRAFT", "VND", "Tee", "M", new java.math.BigDecimal("25000"))))).containsExactly(RejectionCode.PRODUCT_INACTIVE);
     }
 
     @Test
     @DisplayName("D3: SKU currency differs from the store's, or the store has none → CURRENCY_MISMATCH")
     void currency() {
         assertThat(codes(ok("ACTIVE", true, List.of(), new OrderQuote.SkuQuote("A", true, PRODUCT, "ACTIVE",
-                "ACTIVE", "USD")))).containsExactly(RejectionCode.CURRENCY_MISMATCH);
-        assertThat(codes(new QuoteResult.Ok(new OrderQuote("ACTIVE", null, true, List.of(), List.of(sku("A"))))))
+                "ACTIVE", "USD", "Tee", "M", new java.math.BigDecimal("25000"))))).containsExactly(RejectionCode.CURRENCY_MISMATCH);
+        assertThat(codes(new QuoteResult.Ok(new OrderQuote("ACTIVE", null, true, List.of(), List.of(sku("A")), "HCM01", "Asia/Ho_Chi_Minh", java.time.LocalDate.of(2026, 11, 16), null))))
                 .containsExactly(RejectionCode.CURRENCY_MISMATCH);
     }
 
@@ -99,5 +99,50 @@ class QuoteReasonMapperTest {
                 .containsExactly(RejectionReason.store(RejectionCode.INVALID_REQUEST, STORE));
         assertThat(mapper.reasons(store, new QuoteResult.Unavailable("x")))
                 .containsExactly(RejectionReason.store(RejectionCode.STORE_UNAVAILABLE, STORE));
+    }
+
+    private static QuoteResult quote(String currency, String code, java.time.LocalDate day, OrderQuote.SkuQuote sku) {
+        return new QuoteResult.Ok(new OrderQuote("ACTIVE", currency, true, List.of(), List.of(sku), code,
+                "Asia/Ho_Chi_Minh", day, null));
+    }
+
+    private static OrderQuote.SkuQuote priced(String currency, String price, String name) {
+        return new OrderQuote.SkuQuote("A", true, PRODUCT, "ACTIVE", "ACTIVE", currency, name, "M",
+                price == null ? null : new java.math.BigDecimal(price));
+    }
+
+    @Test
+    @DisplayName("D7: a currency not ISO 4217 or without minor units → CURRENCY_MISMATCH per line")
+    void unusableCurrency() {
+        java.time.LocalDate day = java.time.LocalDate.of(2026, 11, 16);
+        assertThat(codes(quote("XYZ", "HCM01", day, priced("XYZ", "1", "Tee"))))
+                .containsExactly(RejectionCode.CURRENCY_MISMATCH);
+        assertThat(codes(quote("XAU", "HCM01", day, priced("XAU", "1", "Tee"))))
+                .containsExactly(RejectionCode.CURRENCY_MISMATCH);
+        assertThat(codes(quote("USD", "HCM01", day, priced("USD", "1", "Tee")))).isEmpty();
+    }
+
+    @Test
+    @DisplayName("no local day → STORE_CLOSED; a store code outside [A-Z0-9]{1,20} → STORE_UNAVAILABLE (D4)")
+    void dayAndCode() {
+        assertThat(codes(quote("VND", "HCM01", null, priced("VND", "1", "Tee"))))
+                .containsExactly(RejectionCode.STORE_CLOSED);
+        assertThat(codes(quote("VND", "q-1", java.time.LocalDate.of(2026, 11, 16), priced("VND", "1", "Tee"))))
+                .containsExactly(RejectionCode.STORE_UNAVAILABLE);
+        assertThat(codes(quote("VND", null, java.time.LocalDate.of(2026, 11, 16), priced("VND", "1", "Tee"))))
+                .containsExactly(RejectionCode.STORE_UNAVAILABLE);
+    }
+
+    @Test
+    @DisplayName("Q1: a null or negative price, or no product name → STORE_UNAVAILABLE; price 0 is accepted")
+    void price() {
+        java.time.LocalDate day = java.time.LocalDate.of(2026, 11, 16);
+        assertThat(codes(quote("VND", "HCM01", day, priced("VND", null, "Tee"))))
+                .containsExactly(RejectionCode.STORE_UNAVAILABLE);
+        assertThat(codes(quote("VND", "HCM01", day, priced("VND", "-1", "Tee"))))
+                .containsExactly(RejectionCode.STORE_UNAVAILABLE);
+        assertThat(codes(quote("VND", "HCM01", day, priced("VND", "1", null))))
+                .containsExactly(RejectionCode.STORE_UNAVAILABLE);
+        assertThat(codes(quote("VND", "HCM01", day, priced("VND", "0", "Tee")))).isEmpty();
     }
 }

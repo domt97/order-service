@@ -19,11 +19,18 @@ spring:
     password: ${DB_PASSWORD:postgres}
 
     hikari:
-      maximum-pool-size: 10
+      # 15: up to 6 listener threads (PlaceCheckout + 5 replies) and 2 job threads each hold one connection at a time,
+      # plus HTTP and headroom.
+      maximum-pool-size: 15
       minimum-idle: 5
       idle-timeout: 30000
       connection-timeout: 20000
       max-lifetime: 1800000
+      data-source-properties:
+        # BR-ORD-15: without this, pgjdbc puts the server's DETAIL ("Failing row contains (...)", with the delivery
+        # name, phone and address) and a failed batch entry's SQL with its values into the exception message, and so
+        # into the logs and the DLT headers. Every connection to this database must set it (see Flyway below).
+        logServerErrorDetail: false
 
   jpa:
     open-in-view: false
@@ -43,9 +50,15 @@ spring:
     locations: classpath:db/migration
     schemas: orders
     default-schema: orders
-    url: jdbc:postgresql://localhost:5432/orders?currentSchema=orders
-    user: ${DB_USER:postgres}
-    password: ${DB_PASSWORD:postgres}
+    # No flyway url/user/password: Flyway uses the application DataSource above, so it gets logServerErrorDetail=false.
+    # A separate Flyway connection (spring.flyway.url, or spring.flyway.user alone, or a @FlywayDataSource bean) must
+    # set it too.
+
+  task:
+    scheduling:
+      # Two jobs (reserve timeout, stock command re-send): one thread each, so a slow run of one never delays the other.
+      pool:
+        size: 2
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
@@ -57,14 +70,21 @@ spring:
 app:
   kafka:
     place-checkout:
-      # Off until placement is built (next PR): a checkout that passes every check is not placed yet, so PlaceCheckout
-      # must not be consumed where carts send it. Also gates the PlaceCheckout.DLT topic bean.
+      # Off until the go-live gates ship (D1: acceptance and cancel, delivery quotes, by-key/expire, cart-service):
+      # a placed and confirmed order holds its stock sold and nothing can accept, cancel or auto-reject it yet.
+      # Also gates the PlaceCheckout.DLT topic bean.
       # Poll sizing (max.poll.records=1 on the listener): worst case per record = lookup (Hikari wait 20 s) + quoting
-      # <= quote-budget (20 s) + outcome transaction (20 s wait + 5 s) + re-read after a lost insert (20 s wait) +
-      # CONTENT_MISMATCH transaction (20 s + 5 s) = 110 s, + 60 s backoff = 170 s < max.poll.interval.ms (300 s).
-      # Re-check when one of these changes.
+      # <= quote-budget (20 s) + placement transaction (20 s wait + 10 s) + DailyCapReached -> outcome transaction
+      # (20 s + 5 s) + re-read after a lost insert (20 s wait) + CheckoutPlaced or CONTENT_MISMATCH transaction
+      # (20 s + 5 s) = 140 s, + 60 s backoff = 200 s < max.poll.interval.ms (300 s). Re-check when one changes.
       enabled: ${PLACE_CHECKOUT_ENABLED:false}
-    # Replication factor of the dead-letter topics (PlaceCheckout.DLT); 3 in production.
+    stock-replies:
+      # The five inventory reply listeners (StockReserved, ...): on, also while PlaceCheckout is off, so a started
+      # saga always ends. false only for a local run without Kafka. Also gates their five DLT topic beans.
+      # Poll sizing (max.poll.records=5): one connection wait (20 s) + one 10 s transaction per record
+      # = 5 x 30 s = 150 s, + 60 s backoff = 210 s < max.poll.interval.ms (300 s). Re-check when one changes.
+      enabled: ${STOCK_REPLIES_ENABLED:true}
+    # Replication factor of the dead-letter topics (PlaceCheckout.DLT, the stock-reply DLTs); 3 in production.
     dlt-replicas: ${KAFKA_DLT_REPLICAS:1}
   checkout:
     # ADR 0007: no checkout for the key and requestedAt older than this -> STALE (shorter than the 15-min stock hold).
@@ -73,6 +93,20 @@ app:
     clock-skew: ${CHECKOUT_CLOCK_SKEW:PT30S}
     # Time for all order-quote calls of one command; a store not answered within it -> STORE_UNAVAILABLE.
     quote-budget: ${CHECKOUT_QUOTE_BUDGET:PT20S}
+  stock:
+    # D3: a PENDING checkout waits this long for every store's reserve reply (much shorter than the 15-min hold).
+    reserve-timeout: ${STOCK_RESERVE_TIMEOUT:PT150S}
+    # An open Confirm or Release is re-sent after resend-initial, doubling up to resend-max; never given up.
+    resend-initial: ${STOCK_RESEND_INITIAL:PT150S}
+    resend-max: ${STOCK_RESEND_MAX:PT10M}
+    # The two jobs (reserve timeout, re-send) start this long after the previous run ended.
+    job-delay: ${STOCK_JOB_DELAY:PT10S}
+    # No reserve timeout until this long after start: replies queued while the service was down are read first.
+    startup-grace: ${STOCK_STARTUP_GRACE:PT150S}
+    # A run stops starting new calls after this; worst run 85 s (timeout) / 90 s (re-send), see StockCommandResendService.
+    run-budget: ${STOCK_RUN_BUDGET:PT5S}
+    # Checkouts per timeout run, orders per re-send batch (max 50).
+    batch-size: ${STOCK_BATCH_SIZE:50}
   clients:
     stores:
       base-url: ${STORES_SERVICE_URL:http://localhost:8048}
@@ -85,6 +119,14 @@ app:
     title: Order Service API
     version: v1
     description: Order service REST API
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # The saga metrics (order.saga.*) and health. Not authenticated, like /internal/** (open question 65): keep
+        # the port off the public network.
+        include: health,metrics
 
 logging:
   pattern:

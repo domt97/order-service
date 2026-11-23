@@ -33,7 +33,8 @@ class StoresOrderQuoteClientTest {
 
     private static final UUID MERCHANT = UUID.randomUUID();
     private static final String OK_BODY = """
-            {"store":{"id":"%s","status":"ACTIVE","currency":"VND","timeZone":"Asia/Ho_Chi_Minh"},
+            {"store":{"id":"%s","code":"HCM01","status":"ACTIVE","currency":"VND","timeZone":"Asia/Ho_Chi_Minh",
+                      "maxOrdersPerDay":40},
              "merchantStatus":"ACTIVE","now":"2026-11-16T03:00:00Z","localDate":"2026-11-16","open":true,
              "reasons":[],"closedWindowTypes":[],
              "skus":[{"sku":"TS-M","found":true,"productId":"%s","productName":"Tee","skuName":"M","price":25000,
@@ -71,6 +72,10 @@ class StoresOrderQuoteClientTest {
                 case "garbage" -> {
                     status = 200;
                     body = "not json";
+                }
+                case "bad-date" -> {
+                    status = 200;
+                    body = OK_BODY.formatted(store, product).replace("\"2026-11-16\"", "\"16/11/2026\"");
                 }
                 case "stall-body" -> {
                     // Headers and the first bytes at once, then nothing: only a per-read timeout ends this.
@@ -152,7 +157,16 @@ class StoresOrderQuoteClientTest {
         assertThat(result).isInstanceOfSatisfying(QuoteResult.Ok.class, ok -> {
             assertThat(ok.quote().storeCurrency()).isEqualTo("VND");
             assertThat(ok.quote().open()).isTrue();
-            assertThat(ok.quote().skus()).singleElement().satisfies(s -> assertThat(s.productId()).isEqualTo(product));
+            assertThat(ok.quote().storeCode()).isEqualTo("HCM01");
+            assertThat(ok.quote().timeZone()).isEqualTo("Asia/Ho_Chi_Minh");
+            assertThat(ok.quote().localDate()).isEqualTo(java.time.LocalDate.of(2026, 11, 16));
+            assertThat(ok.quote().maxOrdersPerDay()).isEqualTo(40);
+            assertThat(ok.quote().skus()).singleElement().satisfies(s -> {
+                assertThat(s.productId()).isEqualTo(product);
+                assertThat(s.productName()).isEqualTo("Tee");
+                assertThat(s.skuName()).isEqualTo("M");
+                assertThat(s.price()).isEqualByComparingTo("25000");
+            });
         });
         assertThat(requestIds.get(store.toString())).isEqualTo(requestId);
     }
@@ -188,6 +202,15 @@ class StoresOrderQuoteClientTest {
     void garbage() {
         UUID store = storeWith("garbage");
         assertThat(client(Duration.ofSeconds(3)).quote(MERCHANT, store, List.of(), Duration.ofSeconds(20)))
+                .isInstanceOf(QuoteResult.Unavailable.class);
+        assertThat(calls.get(store.toString()).get()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a malformed localDate → Unavailable (STORE_UNAVAILABLE), called once")
+    void badLocalDate() {
+        UUID store = storeWith("bad-date");
+        assertThat(client(Duration.ofSeconds(3)).quote(MERCHANT, store, List.of("TS-M"), Duration.ofSeconds(20)))
                 .isInstanceOf(QuoteResult.Unavailable.class);
         assertThat(calls.get(store.toString()).get()).isEqualTo(1);
     }

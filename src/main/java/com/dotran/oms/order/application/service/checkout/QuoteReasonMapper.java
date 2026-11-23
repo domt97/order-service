@@ -4,7 +4,10 @@ import com.dotran.oms.order.application.command.checkout.PlaceCheckoutCmd;
 import com.dotran.oms.order.application.dto.quote.OrderQuote;
 import com.dotran.oms.order.application.dto.quote.QuoteResult;
 import com.dotran.oms.order.domain.enums.RejectionCode;
+import com.dotran.oms.order.domain.valueobject.CurrencyRules;
+import com.dotran.oms.order.domain.valueobject.OrderNumber;
 import com.dotran.oms.order.domain.valueobject.RejectionReason;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -18,9 +21,12 @@ import java.util.stream.Collectors;
 
 /**
  * Turns one store's order quote into rejection reasons (BR-ORD-02; the order-quote mapping decided 2026-11-15 in
- * integration.md; D3 and D4 decided 2026-11-16). Daily cap and delivery fee are checked at placement (next PR).
+ * integration.md; D3 and D4 decided 2026-11-16). Also refuses what placement cannot snapshot (decided 2026-11-21:
+ * D4 store code, D7 currency, Q1 price): a passing quote always yields complete orders. The daily cap is taken in the
+ * placement transaction; the delivery fee comes with delivery quotes (D2).
  */
 @Component
+@Slf4j
 public class QuoteReasonMapper {
 
     private static final Set<String> CLOSED_REASONS = Set.of("OUTSIDE_HOURS", "CLOSED_WINDOW", "INVALID_SCHEDULE");
@@ -38,7 +44,7 @@ public class QuoteReasonMapper {
         return List.of(RejectionReason.store(RejectionCode.STORE_UNAVAILABLE, storeId));
     }
 
-    private static List<RejectionReason> fromQuote(PlaceCheckoutCmd.Store store, OrderQuote quote) {
+    private List<RejectionReason> fromQuote(PlaceCheckoutCmd.Store store, OrderQuote quote) {
         UUID storeId = store.storeId();
         List<RejectionReason> reasons = new ArrayList<>();
         if ("SUSPENDED".equals(quote.merchantStatus())) {
@@ -51,8 +57,21 @@ public class QuoteReasonMapper {
         // Not open with no reason we know of: closed, never open by accident.
         boolean unknownReason = !quote.open() && quote.reasons().stream()
                 .noneMatch(r -> CLOSED_REASONS.contains(r) || "STORE_NOT_ACTIVE".equals(r));
-        if (closedReason || unknownReason) {
+        // No local day (the store's time zone is unreadable): no daily cap or order number can be given.
+        if (closedReason || unknownReason || quote.localDate() == null) {
             reasons.add(RejectionReason.store(RejectionCode.STORE_CLOSED, storeId));
+        }
+        if (!OrderNumber.validStoreCode(quote.storeCode())) {
+            // D4: BR-STO-01 is not enforced by stores-service yet; ids only in the log.
+            log.error("Store code not [A-Z0-9]{1,20}: merchantId={} storeId={}; STORE_UNAVAILABLE",
+                    store.merchantId(), storeId);
+            reasons.add(RejectionReason.store(RejectionCode.STORE_UNAVAILABLE, storeId));
+        }
+        boolean storeCurrencyUsable = quote.storeCurrency() != null
+                && CurrencyRules.minorUnits(quote.storeCurrency()).isPresent();
+        if (quote.storeCurrency() != null && !storeCurrencyUsable) {
+            log.error("Store currency not ISO 4217 with minor units: merchantId={} storeId={}; CURRENCY_MISMATCH",
+                    store.merchantId(), storeId);
         }
         Map<String, OrderQuote.SkuQuote> bySku = quote.skus().stream()
                 .filter(s -> s.sku() != null)
@@ -67,9 +86,17 @@ public class QuoteReasonMapper {
             if (!ACTIVE.equals(sku.status()) || !ACTIVE.equals(sku.productStatus())) {
                 reasons.add(RejectionReason.line(RejectionCode.PRODUCT_INACTIVE, storeId, line.sku()));
             }
-            // D3: a SKU is priced in its store's currency; a store without one cannot sell.
-            if (quote.storeCurrency() == null || !quote.storeCurrency().equals(sku.currency())) {
+            // D3: a SKU is priced in its store's currency; a store without one cannot sell. D7: nor can a currency
+            // that is not ISO 4217 or has no minor units (amounts could not be rounded).
+            if (!storeCurrencyUsable || !quote.storeCurrency().equals(sku.currency())) {
                 reasons.add(RejectionReason.line(RejectionCode.CURRENCY_MISMATCH, storeId, line.sku()));
+            }
+            // Q1: a missing or negative price, or a missing name, cannot be snapshotted (stores-service validates
+            // prices only on write).
+            if (sku.price() == null || sku.price().signum() < 0 || sku.productName() == null) {
+                log.error("order-quote SKU without a usable price or name: merchantId={} storeId={} sku={}; "
+                        + "STORE_UNAVAILABLE", store.merchantId(), storeId, line.sku());
+                reasons.add(RejectionReason.store(RejectionCode.STORE_UNAVAILABLE, storeId));
             }
         }
         return reasons;

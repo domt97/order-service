@@ -11,13 +11,13 @@ public interface PlaceCheckoutUseCase {
     enum PlaceCheckoutOutcome {
         /** A new REJECTED or STALE row and its CheckoutRejected. */
         REJECTED_STORED,
-        /** The key's stored outcome was sent again. */
+        /** The key's stored outcome (CheckoutRejected or CheckoutPlaced) was sent again. */
         REPUBLISHED,
         /** Same key, other content (or another customer's key): CheckoutRejected{CONTENT_MISMATCH}, no row. */
         CONTENT_MISMATCH,
-        /** Every pre-reserve check passed; placement is not built yet: nothing written or sent. */
-        PASSED_NOT_PLACED,
-        /** A PENDING/PLACED row exists (cannot happen before placement is built): nothing sent. */
+        /** Every check passed: the PENDING checkout, its orders and their ReserveStock are written. */
+        PLACEMENT_STARTED,
+        /** A PENDING row exists: inventory's replies decide it; nothing sent now. */
         IN_PROGRESS
     }
 }
